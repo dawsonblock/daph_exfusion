@@ -1,10 +1,15 @@
 #!/usr/bin/env python
 """End-to-end DAPH ExFusion pipeline for state-spaces/mamba-130m-hf.
 
-Downloads the 130M Mamba checkpoint, extracts a single mixer block, maps
-it into a bridge-compatible SimpleMambaBlock, generates 3 domain experts
-via controlled perturbation, calibrates K-FAC + Fisher diagonals, merges
-via TIES-Fisher, and validates PyTorch→MLX parity.
+Downloads the 130M Mamba checkpoint, extracts mixer blocks from 3
+different layers (early, middle, late) as genuine domain experts,
+maps them into bridge-compatible SimpleMambaBlock instances, calibrates
+K-FAC + Fisher diagonals, merges via TIES-Fisher, and validates
+PyTorch→MLX parity.
+
+Using different layers as experts is more meaningful than perturbation:
+each layer has learned genuinely different representations through
+pretraining on the Pile dataset.
 """
 
 import copy
@@ -181,26 +186,31 @@ def main():
     batch_size = 2
     seq_len = 8  # Short sequence to avoid gradient explosion in SSM scan
 
-    # --- Phase 1: Download and Extract Base Block ---
+    # --- Phase 1: Download model and extract 3 layer experts ---
     print("\n[Phase 1] Downloading state-spaces/mamba-130m-hf from Hugging Face...")
     hf_model = MambaForCausalLM.from_pretrained("state-spaces/mamba-130m-hf")
-    hf_mixer = hf_model.backbone.layers[0].mixer
+    n_layers = hf_model.config.n_layer
+    # Pick 3 layers spread across the network: early, middle, late
+    layer_indices = [0, n_layers // 2, n_layers - 1]
+    print(f"    Model has {n_layers} layers. Extracting experts from layers {layer_indices}.")
 
-    print("\n[Phase 2] Initializing baseline SimpleMambaBlock...")
-    base_block = SimpleMambaBlock(hidden_size=hidden_size)
-    extract_and_map_mamba_weights(hf_mixer, base_block)
-
-    # --- Phase 2: Create 3 Specialized Expert Copies ---
-    print("\n[Phase 3] Generating 3 domain-specialized experts via perturbation...")
+    print("\n[Phase 2] Mapping 3 layer mixer blocks into SimpleMambaBlock experts...")
     expert_modules = []
-    torch.manual_seed(0)
-    for i in range(num_experts):
-        expert = copy.deepcopy(base_block)
-        with torch.no_grad():
-            for param in expert.parameters():
-                param.add_(torch.randn_like(param) * 1e-4)
-        expert_modules.append(expert)
-    print(f"    Initialized {num_experts} distinct Mamba experts.")
+    for i, layer_idx in enumerate(layer_indices):
+        hf_mixer = hf_model.backbone.layers[layer_idx].mixer
+        block = SimpleMambaBlock(hidden_size=hidden_size)
+        extract_and_map_mamba_weights(hf_mixer, block)
+        expert_modules.append(block)
+        print(f"    Expert {i}: layer {layer_idx} mapped.")
+
+    # Verify the experts are genuinely different
+    w0 = expert_modules[0].in_proj.weight
+    w1 = expert_modules[1].in_proj.weight
+    w2 = expert_modules[2].in_proj.weight
+    print(f"    Layer 0 vs {layer_indices[1]} weight diff: {(w0 - w1).abs().mean():.6f}")
+    print(f"    Layer 0 vs {layer_indices[2]} weight diff: {(w0 - w2).abs().mean():.6f}")
+    print(f"    Layer {layer_indices[1]} vs {layer_indices[2]} weight diff: {(w1 - w2).abs().mean():.6f}")
+    print(f"    Initialized {num_experts} genuine Mamba experts from different layers.")
 
     # --- Phase 3: Setup MoE Container and Datasets ---
     def block_factory():
