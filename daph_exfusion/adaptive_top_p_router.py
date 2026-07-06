@@ -184,7 +184,7 @@ class DAPHDecoderLayerV2(nn.Module):
         # Memoise the FFT based on the normalised tensor's identity.
         # This avoids recomputing fft2 when the same hidden state is
         # processed multiple times (e.g. across layers with identical input).
-        cache_key = (x.data_ptr(), x.shape, x.device)
+        cache_key = (x.data_ptr(), x._version, x.shape, x.device)
         if hasattr(self, '_fft_cache') and self._fft_cache.get('key') == cache_key:
             x_fft = self._fft_cache['value']
         else:

@@ -1,5 +1,88 @@
 # Patch Notes
 
+## v4.3.9 — Architectural Hardening (2026-07-05)
+
+Six fixes addressing cache safety, structural parity, compute efficiency,
+robust topology discovery, orchestrator completeness, and Metal shader
+scalability.
+
+### 1. FFT Cache Invalidation Hazard
+
+`_cheap_path` memoised FFT results using `data_ptr()` as a cache key.
+PyTorch's caching allocator aggressively recycles deallocated memory
+addresses, so a freed tensor's `data_ptr()` can be reassigned to a
+completely different tensor, causing silent false cache hits on stale
+data.
+
+Fix: added `x._version` to the cache key. The version counter increments
+on any in-place modification, so stale tensors with recycled addresses
+won't match.
+
+### 2. Cheap Path Residual Structure Alignment
+
+`MLXFNetBlock` (MLX) added an internal residual connection
+(`residual + self.ff(x_fft)`), but `DAPHDecoderLayerV2._cheap_path`
+(PyTorch) returned only `self.cheap_proj(x_fft)` without residual. Both
+outer decoder layers add their own residual, so the MLX path
+double-residualled, causing numerical divergence across the bridge.
+
+Fix: removed the internal residual from `MLXFNetBlock`. Both paths now
+return only the projection output, letting the outer decoder layer
+handle residual blending uniformly.
+
+### 3. MLX Routing Compute Savings
+
+`MLXDAPHDecoderLayer` computed all three paths (attention, FFN+Mamba,
+cheap) unconditionally even though the macro-router selects only one
+dominant path per forward. This negated the efficiency benefit of
+routing.
+
+Fix: added `skip_inactive_paths` flag (default `False`). When enabled,
+the layer syncs to read the dominant path index and computes only that
+path, trading a small device-to-host sync for real FLOP savings.
+Disabled by default to preserve JIT graph caching.
+
+### 4. Robust FFN Topology Discovery
+
+`_get_weights` extracted weights from non-SwiGLU experts using hardcoded
+indices (`expert[0]`, `expert[3]`). If a user passed an expert with
+auxiliary layers (LayerNorm, Dropout, custom activations), the indices
+targeted wrong submodules, causing attribute errors or silent corruption.
+
+Fix: added `_extract_linear_weights` helper that dynamically discovers
+`nn.Linear` layers by recursively traversing child modules. The first
+`nn.Linear` is "up", the last is "down". Replaced both hardcoded
+instances.
+
+### 5. Orchestrator Mamba Support
+
+`AutomatedMergePipeline` only automated FFN expert tracking and Fisher
+diagonal. Mamba experts required manual Fisher dictionary construction,
+making the "automated" pipeline incomplete.
+
+Fix: `execute()` now automatically tracks K-FAC scores and builds Fisher
+diagonals for Mamba experts when the layer has a `mamba_path` with
+experts. Mamba is included in the coordinate-descent calibration loop
+and results are returned in the diagnostic dict.
+
+### 6. Dynamic Metal Shader Register Allocation
+
+The Metal kernel used a static `float h_states[16]` and rejected
+`d_state > 16`. Modern Mamba-2 and Jamba models frequently use
+`d_state = 32, 64, or higher`.
+
+Fix: replaced the static kernel with a dynamic kernel factory
+`_get_mamba_scan_kernel(d_state)` that generates shader source with the
+correct array size. Compiled kernels are cached per `d_state`. Supports
+`d_state` up to 128 (configurable via `_MAMBA_MAX_D_STATE`). The
+hardcoded `d_state > 16` guard is replaced by the dynamic limit.
+
+### Test results
+
+- **63 passed, 0 failed** — full green suite maintained.
+
+---
+
 ## v4.3.8 — Metal Shader OOB Guard (2026-07-05)
 
 ### 1. Fused Metal Shader Out-Of-Bounds Thread Guard (Critical)

@@ -58,6 +58,33 @@ import torch.nn.functional as F
 # 0. SHARED UTILITIES
 # =============================================================================
 
+def _extract_linear_weights(expert: nn.Module) -> dict:
+    """Extract up/down weights from a non-SwiGLU expert module.
+
+    Dynamically discovers ``nn.Linear`` layers by recursively traversing
+    child modules, rather than relying on hardcoded sequential indices.
+    The first ``nn.Linear`` is treated as the "up" projection and the
+    last as the "down" projection, matching the standard FFN layout.
+
+    Handles experts with auxiliary layers (LayerNorm, Dropout, custom
+    activations) interspersed between projections.
+    """
+    linears = [m for m in expert.modules() if isinstance(m, nn.Linear)]
+    if len(linears) < 2:
+        raise ValueError(
+            f"Expert {type(expert).__name__} has {len(linears)} nn.Linear "
+            f"layers, expected at least 2 (up + down)."
+        )
+    up_layer, down_layer = linears[0], linears[-1]
+    d = {"up.weight": up_layer.weight.data}
+    if up_layer.bias is not None:
+        d["up.bias"] = up_layer.bias.data
+    d["down.weight"] = down_layer.weight.data
+    if down_layer.bias is not None:
+        d["down.bias"] = down_layer.bias.data
+    return d
+
+
 class SwiGLUFFN(nn.Module):
     """Proper SwiGLU FFN module: down(silu(gate(x)) * up(x)).
 
@@ -817,14 +844,7 @@ def compute_ties_aligned_deltas(
                 d["down.bias"] = expert.down.bias.data
             return d
         else:
-            d = {"up.weight": expert[0].weight.data}
-            if expert[0].bias is not None:
-                d["up.bias"] = expert[0].bias.data
-            down_idx = 3 if len(expert) > 3 else -1
-            d["down.weight"] = expert[down_idx].weight.data
-            if expert[down_idx].bias is not None:
-                d["down.bias"] = expert[down_idx].bias.data
-            return d
+            return _extract_linear_weights(expert)
 
     base = {}
     for k in get_weights(first).keys():
@@ -1506,14 +1526,7 @@ class MemoryBankExFusionFFN(nn.Module):
             if expert.down.bias is not None:
                 d["down.bias"] = expert.down.bias.data
             return d
-        d = {"up.weight": expert[0].weight.data}
-        if expert[0].bias is not None:
-            d["up.bias"] = expert[0].bias.data
-        down_idx = 3 if len(expert) > 3 else -1
-        d["down.weight"] = expert[down_idx].weight.data
-        if expert[down_idx].bias is not None:
-            d["down.bias"] = expert[down_idx].bias.data
-        return d
+        return _extract_linear_weights(expert)
 
     @torch.no_grad()
     def merge_to_dense(

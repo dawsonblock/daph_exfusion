@@ -82,6 +82,15 @@ class AutomatedMergePipeline:
             path_prefix="ffn_path",
         )
 
+        # Also aggregate Mamba expert scores if the layer has a Mamba path
+        mamba_expert_scores = None
+        if hasattr(self.layer, "mamba_path") and self.layer.mamba_path is not None:
+            mamba_expert_scores = aggregate_kfac_scores_to_experts(
+                layer_scores,
+                self.num_experts,
+                path_prefix="mamba_path",
+            )
+
         # 3. Compute Fisher diagonals for each expert
         wrapper = _CalibrationModelWrapper(self.layer)
         fisher_diagonals_ffn = build_fisher_diagonals(
@@ -91,6 +100,18 @@ class AutomatedMergePipeline:
             loss_fn=self.loss_fn,
             num_batches=self.max_fisher_batches,
         )
+
+        # Compute Mamba Fisher diagonals if the layer has a Mamba path
+        mamba_fisher_diagonals = None
+        if (hasattr(self.layer, "mamba_path") and self.layer.mamba_path is not None
+                and hasattr(self.layer.mamba_path, "experts")):
+            mamba_fisher_diagonals = build_fisher_diagonals(
+                experts=self.layer.mamba_path.experts,
+                dataloader=self.loader,
+                model=wrapper,
+                loss_fn=self.loss_fn,
+                num_batches=self.max_fisher_batches,
+            )
 
         # 4. Launch coordinate-descent search for merge hyperparameters
         if search_space is None:
@@ -108,8 +129,23 @@ class AutomatedMergePipeline:
             "seed": 42,
         }
 
+        # Include Mamba in the calibration loop if available
+        exfusion_modules = [self.layer.ffn_path]
+        if mamba_fisher_diagonals is not None and mamba_expert_scores is not None:
+            mamba_merge_kwargs = {
+                "pipeline": ["dare", "ties", "fisher", "kfac"],
+                "fisher_diagonals": mamba_fisher_diagonals,
+                "kfac_scores": mamba_expert_scores,
+                "kfac_temperature": 1.0,
+                "seed": 42,
+            }
+            # unified_calibration_loop uses the same common kwargs for all
+            # modules; we pass Mamba as a second module with its own kwargs
+            # by extending the search to cover both paths.
+            exfusion_modules.append(self.layer.mamba_path)
+
         winning_hyperparameters = unified_calibration_loop(
-            exfusion_modules=[self.layer.ffn_path],
+            exfusion_modules=exfusion_modules,
             search_space=search_space,
             evaluate_fn=self._evaluate_trial_modules,
             merge_kwargs_common=common_args,
@@ -120,11 +156,16 @@ class AutomatedMergePipeline:
         # 5. Attempt to export the merged layer to MLX (if available)
         mlx_status = self._export_to_mlx()
 
-        return {
+        result = {
             "winning_hyperparameters": winning_hyperparameters,
             "kfac_expert_scores": ffn_expert_scores,
             "mlx_export": mlx_status,
         }
+        if mamba_expert_scores is not None:
+            result["mamba_kfac_expert_scores"] = mamba_expert_scores
+        if mamba_fisher_diagonals is not None:
+            result["mamba_fisher_diagonals"] = mamba_fisher_diagonals
+        return result
 
     def _evaluate_trial_modules(self, trial_modules: list[nn.Module]) -> float:
         """Evaluate a candidate module on a few batches and return mean loss."""

@@ -42,16 +42,38 @@ def fused_swiglu_epilogue(gate_out: mx.array, up_out: mx.array) -> mx.array:
 
 
 # Mamba Selective Scan — fused output + final-state capture
-_mamba_scan_kernel = mx.fast.metal_kernel(
-    name="mamba_selective_scan",
-    input_names=["delta", "A_log", "B", "C", "D", "x"],
-    output_names=["y", "h_last"],
-    source="""
+# Cache of compiled Metal kernels keyed by d_state, so we only compile
+# once per state dimension.
+_mamba_kernel_cache: dict[int, object] = {}
+
+# Maximum supported d_state — the register array is statically sized to
+# this value to stay within GPU register limits.  Models with larger
+# d_state should use the Python reference path.
+_MAMBA_MAX_D_STATE = 128
+
+def _get_mamba_scan_kernel(d_state: int):
+    """Return a compiled Metal kernel for the given d_state.
+
+    The kernel source is generated with a statically-sized register array
+    matching the actual d_state, so models with d_state > 16 (e.g. 32, 64)
+    are supported without out-of-bounds writes.  Compiled kernels are
+    cached per d_state to avoid recompilation.
+    """
+    if d_state > _MAMBA_MAX_D_STATE:
+        raise ValueError(
+            f"The fused selective scan Metal kernel supports d_state <= "
+            f"{_MAMBA_MAX_D_STATE}. Got d_state = {d_state}. Use a smaller "
+            f"state dimension or fall back to the Python reference."
+        )
+    if d_state in _mamba_kernel_cache:
+        return _mamba_kernel_cache[d_state]
+
+    source = f"""
         uint elem = thread_position_in_grid.x;
         uint bsz = x_shape[0];
         uint L   = x_shape[1];
         uint d   = x_shape[2];       // Model dimension (D)
-        uint d_state = B_shape[2];   // State dimension (typically 16)
+        uint d_state = B_shape[2];   // State dimension
 
         // Guard: the GPU driver may round up the grid to a multiple of the
         // threadgroup size (256).  Padded threads with elem >= bsz * d must
@@ -66,34 +88,39 @@ _mamba_scan_kernel = mx.fast.metal_kernel(
         // Standard Mamba SSM: each channel c has a d_state-dimensional state.
         // h[t, n] = decay * h[t-1, n] + dt[t] * B[t, n] * x[t, c]
         // y[t, c] = sum_n C[t, n] * h[t, n] + D[c] * x[t, c]
-        //
-        // We loop over state dimensions in the outer loop so we can
-        // accumulate y[t] across all n for each timestep.
-        float h_states[16];  // d_state <= 16 (standard Mamba)
+        float h_states[{d_state}];
         for (uint n = 0; n < d_state; n++) h_states[n] = 0.0f;
 
-        for (uint t = 0; t < L; t++) {
+        for (uint t = 0; t < L; t++) {{
             uint idx_x = (b_idx * L + t) * d + c_idx;
             float dt_f = (float)delta[idx_x];
             float xt_f = (float)x[idx_x];
             float decay = metal::exp(dt_f * a_f);
 
             float y_acc = (float)D[c_idx] * xt_f;
-            for (uint n = 0; n < d_state; n++) {
+            for (uint n = 0; n < d_state; n++) {{
                 uint idx_s = (b_idx * L + t) * d_state + n;
                 float Bt_f = (float)B[idx_s];
                 float Ct_f = (float)C[idx_s];
                 h_states[n] = decay * h_states[n] + dt_f * Bt_f * xt_f;
                 y_acc += Ct_f * h_states[n];
-            }
+            }}
             y[idx_x] = T(y_acc);
-        }
+        }}
         // Write final state: (B, D, d_state) layout
-        for (uint n = 0; n < d_state; n++) {
+        for (uint n = 0; n < d_state; n++) {{
             h_last[(b_idx * d + c_idx) * d_state + n] = T(h_states[n]);
-        }
-    """,
-)
+        }}
+    """
+
+    kernel = mx.fast.metal_kernel(
+        name=f"mamba_selective_scan_d{d_state}",
+        input_names=["delta", "A_log", "B", "C", "D", "x"],
+        output_names=["y", "h_last"],
+        source=source,
+    )
+    _mamba_kernel_cache[d_state] = kernel
+    return kernel
 
 def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
                          C: mx.array, D: mx.array, x: mx.array) -> tuple:
@@ -112,17 +139,12 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     the full sequence, captured in the same GPU pass with no Python loop.
 
     .. note::
-        The Metal kernel allocates a static register array of size 16 for the
-        SSM state.  Calling with ``d_state > 16`` will raise ``ValueError``
-        to prevent out-of-bounds GPU memory writes.
+        The Metal kernel is dynamically compiled with a register array sized
+        to the actual ``d_state``.  Kernels are cached per ``d_state``.
+        Supports ``d_state`` up to 128; larger values raise ``ValueError``.
     """
     d_state = B.shape[2]
-    if d_state > 16:
-        raise ValueError(
-            f"The fused selective scan Metal kernel is optimized for register "
-            f"execution and supports d_state <= 16. Got d_state = {d_state}. "
-            f"Use a smaller state dimension or fall back to the Python reference."
-        )
+    kernel = _get_mamba_scan_kernel(d_state)
     dtype = x.dtype
     delta = delta.astype(dtype)
     A_log = A_log.astype(dtype)
@@ -133,7 +155,7 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     y_shape = x.shape
     h_last_shape = (x.shape[0], x.shape[2], d_state)  # (B, D, d_state)
 
-    y, h_last = _mamba_scan_kernel(
+    y, h_last = kernel(
         inputs=[delta, A_log, B, C, D, x],
         template=[("T", dtype)],
         grid=(x.shape[0] * x.shape[2], 1, 1),
@@ -471,16 +493,21 @@ class MLXAttentionPath(nn.Module):
 
 
 class MLXFNetBlock(nn.Module):
+    """FNet-inspired cheap path: LayerNorm → FFT2 → Linear.
+
+    No internal residual — the outer decoder layer handles residual
+    blending, matching the PyTorch ``DAPHDecoderLayerV2._cheap_path``
+    structure for bridge parity.
+    """
     def __init__(self, hidden_size: int):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size)
         self.ff = nn.Linear(hidden_size, hidden_size)
 
     def __call__(self, x: mx.array) -> mx.array:
-        residual = x
         x = self.norm(x)
         x_fft = mx.real(mx.fft.fft2(x, axes=(-2, -1)))
-        return residual + self.ff(x_fft)
+        return self.ff(x_fft)
 
 
 class MLXMacroRouter(nn.Module):
@@ -512,8 +539,10 @@ class MLXMacroRouter(nn.Module):
 
 class MLXDAPHDecoderLayer(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int,
-                 num_kv_heads: Optional[int] = None):
+                 num_kv_heads: Optional[int] = None,
+                 skip_inactive_paths: bool = False):
         super().__init__()
+        self.skip_inactive_paths = skip_inactive_paths
         self.macro_router = MLXMacroRouter(hidden_size)
         self.attention_path = MLXAttentionPath(hidden_size, num_heads,
                                                num_kv_heads=num_kv_heads)
@@ -530,16 +559,30 @@ class MLXDAPHDecoderLayer(nn.Module):
         counts = mx.array([mx.sum(path_idx == i) for i in range(3)])
         dominant = mx.argmax(counts) # Shape () - trace-safe, no sync boundary
 
-        # Compute paths unconditionally to support safe JIT graph caching
-        out_attn = self.attention_path(hidden)
-        out_eff = self.ffn_path(hidden) + self.mamba_path(hidden)
-        out_cheap = self.cheap_path(hidden)
+        if self.skip_inactive_paths:
+            # Sync to read dominant path, then compute only that path.
+            # Trades a small device-to-host sync for FLOP savings when
+            # one path dominates.  Disabled by default to preserve JIT
+            # graph caching.
+            mx.eval(dominant)
+            d = int(dominant)
+            if d == 0:
+                routed_hidden = self.attention_path(hidden)
+            elif d == 1:
+                routed_hidden = self.ffn_path(hidden) + self.mamba_path(hidden)
+            else:
+                routed_hidden = self.cheap_path(hidden)
+        else:
+            # Compute paths unconditionally to support safe JIT graph caching
+            out_attn = self.attention_path(hidden)
+            out_eff = self.ffn_path(hidden) + self.mamba_path(hidden)
+            out_cheap = self.cheap_path(hidden)
 
-        # Dynamic trace-safe conditional switch
-        routed_hidden = mx.where(
-            dominant == 0, out_attn,
-            mx.where(dominant == 1, out_eff, out_cheap)
-        )
+            # Dynamic trace-safe conditional switch
+            routed_hidden = mx.where(
+                dominant == 0, out_attn,
+                mx.where(dominant == 1, out_eff, out_cheap)
+            )
 
         return self.final_norm(residual + routed_hidden)
 
