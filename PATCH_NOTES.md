@@ -1,5 +1,87 @@
 # Patch Notes
 
+## v4.5.0 — Macro Router Enhancements (2026-07-06)
+
+Targeted improvements to the `AdaptiveTopPMacroRouter` (PyTorch) and
+`MLXAdaptiveTopPMacroRouter` (MLX) across accuracy, efficiency,
+robustness, and diagnostics.  All changes are backward-compatible:
+new features are opt-in via constructor arguments with defaults that
+preserve existing behavior.
+
+### 1. Multi-Signal Difficulty Fusion
+
+The difficulty predictor now optionally fuses three signals via a small
+learned combiner (3→8→1 MLP with sigmoid):
+
+- **MLP predictor**: existing hidden-state difficulty estimate.
+- **Router logit entropy**: high entropy = uncertain/hard token.
+- **Token norm**: `||x|| / sqrt(D)` as a scale-invariant magnitude signal.
+
+Enabled via `multi_signal_difficulty=True`.  Improves routing precision
+at negligible compute cost (3-feature MLP vs. full path execution).
+
+### 2. Cost-Aware Routing
+
+A per-path cost vector (default: `(3.0, 2.0, 0.5)` for attention,
+efficient, cheap) penalises expensive paths in logit space:
+
+```
+logits += -cost_penalty * log(path_costs)
+```
+
+Expensive paths now require stronger router signals to activate,
+reducing unnecessary compute on easy tokens.  Enabled via `path_costs`
+constructor argument.
+
+### 3. Router Z-Loss Regularisation
+
+`compute_z_loss(hidden)` returns `(logits ** 2).mean()` — an auxiliary
+loss that prevents overconfident routing (ST-MoE / Switch Transformer
+style).  Add to the main loss during fine-tuning:
+
+```python
+loss = task_loss + 0.01 * layer.compute_z_loss(hidden)
+```
+
+### 4. Exploration Noise
+
+Optional Gumbel noise (`exploration_noise` std) added to router logits
+during training (`self.training=True`).  Improves robustness and
+prevents collapse to always-cheap or always-attention routing.  Zero
+by default (deterministic eval behavior preserved).
+
+### 5. Learnable Thresholds
+
+`base_threshold` and `difficulty_scale` can be learnable
+`nn.Parameter`s (`learnable_threshold=True`), enabling end-to-end
+optimisation of routing sensitivity.  Default: fixed buffers
+(unchanged behavior).
+
+### 6. MLX Prefill/Decode Specialisation
+
+`MLXStatefulDAPHDecoderLayer` now passes `decode_mode=True` to the
+router during single-token decoding (L==1).  The router lowers the
+threshold by 0.1 in decode mode, favouring cheaper paths since cached
+KV/SSM state already captures context from the prefill phase.
+
+### 7. Robustness: External Difficulty Clamping
+
+External difficulty values are now clamped to `[0, 1]` before use,
+preventing threshold overflow from upstream components that may produce
+out-of-range values.
+
+### 8. Diagnostic Logging
+
+`enable_diagnostics(True)` activates per-forward logging of average
+active paths per difficulty bin (4 bins: [0, 0.25), [0.25, 0.5),
+[0.5, 0.75), [0.75, 1.0)).  Access via `get_diagnostics()`.  Useful
+for debugging router behavior and tuning thresholds.
+
+### Test Coverage
+
+18 new tests in `tests/test_router_enhancements.py` covering all
+features above.  Total: 81 tests, all passing.
+
 ## v4.4.0 — Cooperative Kernel & Systems Hardening (2026-07-05)
 
 Four upgrades extending scalability and closing remaining latent

@@ -7,15 +7,32 @@ where higher predicted difficulty lowers the threshold and activates more paths.
 
 Also provides DAPHDecoderLayerV2, an updated decoder layer that uses the
 adaptive router instead of the static softmax blending in DAPHDecoderLayer.
+
+v4.5.0 enhancements:
+  - Multi-signal difficulty: fuses MLP predictor with router entropy and
+    token norm via a small learned combiner.
+  - Cost-aware routing: a per-path cost vector penalises expensive paths
+    so they require stronger router logits to activate.
+  - Router z-loss: auxiliary regularisation to prevent overconfident routing.
+  - Exploration noise: optional Gumbel noise on logits during training.
+  - Learnable thresholds: base_threshold and difficulty_scale can be
+    learned parameters instead of fixed hyperparameters.
+  - Robustness: external_difficulty is clamped to [0, 1]; degenerate
+    num_paths=1 is handled; a fallback path is always guaranteed.
+  - Diagnostics: optional logging of average active paths per difficulty bin.
 """
 
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, List
 
 from .merge_toolkit import MemoryBankExFusionFFN, MemoryBankExFusionMamba
+
+# Default relative compute costs for the three macro-paths.
+# Used by cost-aware routing to penalise expensive paths.
+_DEFAULT_PATH_COSTS = (3.0, 2.0, 0.5)  # (attention, efficient, cheap)
 
 
 class AdaptiveTopPMacroRouter(nn.Module):
@@ -33,6 +50,16 @@ class AdaptiveTopPMacroRouter(nn.Module):
         base_threshold: Default cumulative probability threshold when difficulty=0.5.
         difficulty_scale: How much threshold changes per unit difficulty deviation.
         use_external_difficulty: If True, expects difficulty tensor in forward().
+        path_costs: Per-path relative compute costs.  Expensive paths receive
+            a logit penalty proportional to ``cost_penalty * log(cost)`` so
+            they require stronger router signals to activate.
+        cost_penalty: Scaling factor for the cost-aware logit penalty.
+        multi_signal_difficulty: If True, fuse the MLP predictor with router
+            logit entropy and token norm via a small learned combiner.
+        learnable_threshold: If True, ``base_threshold`` and
+            ``difficulty_scale`` become learnable ``nn.Parameter``s.
+        exploration_noise: Std of Gumbel noise added to logits during training
+            (``self.training=True``).  0.0 disables noise.
     """
 
     def __init__(
@@ -42,15 +69,38 @@ class AdaptiveTopPMacroRouter(nn.Module):
         base_threshold: float = 0.85,
         difficulty_scale: float = 0.3,
         use_external_difficulty: bool = False,
+        path_costs: Optional[Tuple[float, ...]] = None,
+        cost_penalty: float = 0.1,
+        multi_signal_difficulty: bool = False,
+        learnable_threshold: bool = False,
+        exploration_noise: float = 0.0,
     ):
         super().__init__()
         self.num_paths = num_paths
-        self.base_threshold = base_threshold
-        self.difficulty_scale = difficulty_scale
         self.use_external_difficulty = use_external_difficulty
+        self.cost_penalty = cost_penalty
+        self.multi_signal_difficulty = multi_signal_difficulty
+        self.exploration_noise = exploration_noise
+
+        # Learnable or fixed threshold parameters
+        if learnable_threshold:
+            self.base_threshold = nn.Parameter(torch.tensor(base_threshold))
+            self.difficulty_scale = nn.Parameter(torch.tensor(difficulty_scale))
+        else:
+            self.register_buffer("base_threshold", torch.tensor(base_threshold))
+            self.register_buffer("difficulty_scale", torch.tensor(difficulty_scale))
 
         # Path scoring
         self.router = nn.Linear(d_model, num_paths, bias=False)
+
+        # Cost-aware routing: penalise expensive paths in logit space
+        if path_costs is not None:
+            assert len(path_costs) == num_paths
+            # log(cost) penalty — expensive paths get negative bias
+            cost_log = torch.tensor([math.log(c) for c in path_costs])
+            self.register_buffer("cost_log_bias", -cost_penalty * cost_log)
+        else:
+            self.cost_log_bias = None
 
         if not use_external_difficulty:
             self.difficulty_predictor = nn.Sequential(
@@ -59,6 +109,42 @@ class AdaptiveTopPMacroRouter(nn.Module):
                 nn.Linear(max(d_model // 4, 1), 1),
                 nn.Sigmoid(),
             )
+
+            if multi_signal_difficulty:
+                # Small combiner: fuses [mlp_diff, entropy, token_norm] → scalar
+                # 3 input features → hidden → 1 output with sigmoid
+                self.difficulty_combiner = nn.Sequential(
+                    nn.Linear(3, 8),
+                    nn.ReLU(),
+                    nn.Linear(8, 1),
+                    nn.Sigmoid(),
+                )
+
+        # Diagnostics: track average active paths per difficulty bin
+        self._diagnostics_enabled = False
+        self._diagnostics: List[Dict] = []
+
+    def enable_diagnostics(self, enabled: bool = True):
+        """Enable/disable diagnostic logging of routing decisions."""
+        self._diagnostics_enabled = enabled
+        if not enabled:
+            self._diagnostics.clear()
+
+    def get_diagnostics(self) -> List[Dict]:
+        """Return accumulated diagnostic entries (one per forward call)."""
+        return list(self._diagnostics)
+
+    def compute_z_loss(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Auxiliary z-loss to prevent overconfident router logits.
+
+        Encourages the router to keep logits small (regularisation similar
+        to ST-MoE / Switch Transformer load-balancing losses).  Call this
+        during training and add to the main loss.
+        """
+        B, L, D = hidden.shape
+        flat = hidden.view(-1, D)
+        logits = self.router(flat)
+        return (logits ** 2).mean()
 
     def forward(
         self,
@@ -78,13 +164,35 @@ class AdaptiveTopPMacroRouter(nn.Module):
         flat = hidden.view(-1, D)  # (B*L, D)
 
         logits = self.router(flat)  # (B*L, num_paths)
+
+        # Cost-aware routing: subtract log(cost) penalty from logits
+        if self.cost_log_bias is not None:
+            logits = logits + self.cost_log_bias
+
+        # Exploration noise (Gumbel) during training
+        if self.training and self.exploration_noise > 0:
+            gumbel = -torch.empty_like(logits).exponential_().log()
+            logits = logits + self.exploration_noise * gumbel
+
         probs = F.softmax(logits, dim=-1)  # (B*L, num_paths)
 
         # Difficulty per token
         if self.use_external_difficulty:
             if external_difficulty is None:
                 raise ValueError("External difficulty required but None given")
-            diff = external_difficulty.view(-1)  # (B*L,)
+            diff = external_difficulty.view(-1).clamp(0.0, 1.0)  # (B*L,)
+        elif self.multi_signal_difficulty:
+            base_diff = self.difficulty_predictor(flat).squeeze(-1)  # (B*L,)
+            # Router logit entropy: high entropy = uncertain/hard
+            log_probs = F.log_softmax(logits, dim=-1)
+            entropy = -(probs * log_probs).sum(dim=-1)  # (B*L,)
+            max_entropy = math.log(self.num_paths)
+            entropy_norm = entropy / max_entropy  # [0, 1]
+            # Token norm (normalised by sqrt(D) for scale invariance)
+            token_norm = flat.norm(dim=-1) / math.sqrt(D)
+            # Fuse signals
+            combined = torch.stack([base_diff, entropy_norm, token_norm], dim=-1)  # (B*L, 3)
+            diff = self.difficulty_combiner(combined).squeeze(-1)  # (B*L,)
         else:
             diff = self.difficulty_predictor(flat).squeeze(-1)  # (B*L,)
 
@@ -112,7 +220,34 @@ class AdaptiveTopPMacroRouter(nn.Module):
         selected_mask = torch.zeros_like(probs, dtype=torch.bool)
         selected_mask.scatter_(1, indices, mask_sorted)
 
+        # Diagnostics: log average active paths per difficulty bin
+        if self._diagnostics_enabled:
+            self._log_diagnostics(diff, selected_mask, B, L)
+
         return selected_mask.view(B, L, -1), probs.view(B, L, -1)
+
+    def _log_diagnostics(self, diff: torch.Tensor, mask: torch.Tensor, B: int, L: int):
+        """Log average active paths per difficulty bin for debugging."""
+        with torch.no_grad():
+            diff_flat = diff.detach().cpu()
+            active_counts = mask.sum(dim=-1).float().detach().cpu()
+            bins = [0.0, 0.25, 0.5, 0.75, 1.0]
+            bin_stats = {}
+            for i in range(len(bins) - 1):
+                lo, hi = bins[i], bins[i + 1]
+                in_bin = (diff_flat >= lo) & (diff_flat < hi)
+                if in_bin.any():
+                    avg_paths = active_counts[in_bin].mean().item()
+                    count = in_bin.sum().item()
+                else:
+                    avg_paths = 0.0
+                    count = 0
+                bin_stats[f"[{lo:.2f},{hi:.2f})"] = {
+                    "avg_paths": avg_paths, "count": count
+                }
+            self._diagnostics.append({
+                "batch_size": B, "seq_len": L, "bins": bin_stats
+            })
 
 
 class DAPHDecoderLayerV2(nn.Module):
@@ -176,6 +311,23 @@ class DAPHDecoderLayerV2(nn.Module):
     def _clear_ephemeral_cache(module, inputs):
         """Clear ephemeral caches at the boundary of each forward pass."""
         module._fft_cache.clear()
+
+    def compute_z_loss(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Auxiliary router z-loss for training regularisation.
+
+        Delegate to the macro router's ``compute_z_loss`` method.  Add
+        this to the main loss during fine-tuning to prevent overconfident
+        routing.
+        """
+        return self.macro_router.compute_z_loss(hidden)
+
+    def enable_diagnostics(self, enabled: bool = True):
+        """Enable/disable diagnostic logging for this layer's router."""
+        self.macro_router.enable_diagnostics(enabled)
+
+    def get_diagnostics(self) -> List[Dict]:
+        """Return accumulated diagnostic entries from the router."""
+        return self.macro_router.get_diagnostics()
 
     def _cheap_path(self, hidden: torch.Tensor) -> torch.Tensor:
         """Compute the cheap FNet-style path with 2D FFT.

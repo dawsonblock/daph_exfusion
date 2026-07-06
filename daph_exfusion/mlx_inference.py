@@ -767,14 +767,32 @@ class MLXAdaptiveTopPMacroRouter(nn.Module):
     """
     Macro-router executing difficulty-scaled nucleus path selection.
     Compatible with mx.compile tracing boundaries.
+
+    v4.5.0 enhancements mirror the PyTorch router:
+      - Multi-signal difficulty (entropy + norm fusion).
+      - Cost-aware routing via per-path logit bias.
+      - Learnable threshold parameters.
+      - Prefill/decode mode specialisation via ``decode_mode`` flag.
     """
+
     def __init__(self, d_model: int, num_paths: int = 3,
                  base_threshold: float = 0.85,
-                 difficulty_scale: float = 0.3):
+                 difficulty_scale: float = 0.3,
+                 path_costs: Optional[tuple] = None,
+                 cost_penalty: float = 0.1,
+                 multi_signal_difficulty: bool = False,
+                 learnable_threshold: bool = False):
         super().__init__()
         self.num_paths = num_paths
-        self.base_threshold = base_threshold
-        self.difficulty_scale = difficulty_scale
+        self.multi_signal_difficulty = multi_signal_difficulty
+
+        # Learnable or fixed threshold parameters
+        if learnable_threshold:
+            self.base_threshold = mx.array(base_threshold)
+            self.difficulty_scale = mx.array(difficulty_scale)
+        else:
+            self.base_threshold = base_threshold
+            self.difficulty_scale = difficulty_scale
 
         self.router = nn.Linear(d_model, num_paths, bias=False)
         self.difficulty_predictor = nn.Sequential(
@@ -784,10 +802,30 @@ class MLXAdaptiveTopPMacroRouter(nn.Module):
             nn.Sigmoid(),
         )
 
-    def __call__(self, hidden: mx.array) -> tuple:
+        if multi_signal_difficulty:
+            self.difficulty_combiner = nn.Sequential(
+                nn.Linear(3, 8),
+                nn.ReLU(),
+                nn.Linear(8, 1),
+                nn.Sigmoid(),
+            )
+
+        # Cost-aware routing: penalise expensive paths in logit space
+        if path_costs is not None:
+            assert len(path_costs) == num_paths
+            cost_log = mx.array([math.log(c) for c in path_costs])
+            self.cost_log_bias = -cost_penalty * cost_log
+        else:
+            self.cost_log_bias = None
+
+    def __call__(self, hidden: mx.array,
+                 decode_mode: bool = False) -> tuple:
         """
         Args:
             hidden: (B, L, D) intermediate state representation.
+            decode_mode: If True, use a more aggressive (lower) threshold
+                during single-token decoding to save compute, since
+                cached state already captures context.
         Returns:
             selected_mask: (B, L, num_paths) Boolean activation bitmask.
             probs:         (B, L, num_paths) path softmax probability layout.
@@ -797,15 +835,35 @@ class MLXAdaptiveTopPMacroRouter(nn.Module):
         flat = hidden.reshape(-1, D)                      # (B*L, D)
 
         logits = self.router(flat)                        # (B*L, num_paths)
+
+        # Cost-aware routing: subtract log(cost) penalty from logits
+        if self.cost_log_bias is not None:
+            logits = logits + self.cost_log_bias
+
         probs = mx.softmax(logits, axis=-1)               # (B*L, num_paths)
 
         difficulty = self.difficulty_predictor(flat)        # (B*L, 1)
         diff_sq = difficulty.squeeze(-1)                  # (B*L,)
 
+        if self.multi_signal_difficulty:
+            # Router logit entropy: high entropy = uncertain/hard
+            log_probs = mx.log(probs + 1e-8)
+            entropy = -(probs * log_probs).sum(axis=-1)   # (B*L,)
+            max_entropy = math.log(self.num_paths)
+            entropy_norm = entropy / max_entropy           # [0, 1]
+            # Token norm (normalised by sqrt(D))
+            token_norm = mx.sqrt((flat * flat).sum(axis=-1)) / math.sqrt(D)
+            combined = mx.stack([diff_sq, entropy_norm, token_norm], axis=-1)
+            diff_sq = self.difficulty_combiner(combined).squeeze(-1)
+
         # Threshold: higher difficulty → higher threshold → more paths active.
-        # In top-p (nucleus) selection, a higher cumulative-probability threshold
-        # requires accumulating more paths to cross it, so more paths are selected.
         threshold = self.base_threshold + self.difficulty_scale * (diff_sq - 0.5)
+
+        # Decode mode: lower threshold to favour cheaper paths during
+        # single-token generation (cached state already has context).
+        if decode_mode:
+            threshold = threshold - 0.1
+
         threshold = mx.clip(threshold, 0.4, 0.95)  # (B*L,)
 
         # Descending sort via negation
@@ -900,11 +958,26 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
     """
     Stateful DAPH decoder layer with adaptive top-p routing,
     KV-cache for attention, and SSM state for Mamba.
+
+    Passes ``decode_mode=True`` to the router during single-token
+    decoding (L==1) so the router uses a more aggressive threshold
+    that favours cheaper paths, since cached state already captures
+    context from the prefill phase.
     """
     def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int,
-                 num_kv_heads: Optional[int] = None):
+                 num_kv_heads: Optional[int] = None,
+                 path_costs: Optional[tuple] = None,
+                 cost_penalty: float = 0.1,
+                 multi_signal_difficulty: bool = False,
+                 learnable_threshold: bool = False):
         super().__init__()
-        self.macro_router = MLXAdaptiveTopPMacroRouter(hidden_size, num_paths=3)
+        self.macro_router = MLXAdaptiveTopPMacroRouter(
+            hidden_size, num_paths=3,
+            path_costs=path_costs,
+            cost_penalty=cost_penalty,
+            multi_signal_difficulty=multi_signal_difficulty,
+            learnable_threshold=learnable_threshold,
+        )
         self.attention_path = MLXAttentionPath(hidden_size, num_heads,
                                                num_kv_heads=num_kv_heads)
         self.ffn_path = MLXSwiGLUFFN(hidden_size, intermediate_size)
@@ -933,8 +1006,12 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
         residual = hidden
         B, L, D = hidden.shape
 
-        # Compute macro routing masks and probabilities
-        macro_mask, macro_probs, _ = self.macro_router(hidden)
+        # Compute macro routing masks and probabilities.
+        # During single-token decoding (L==1), pass decode_mode=True so
+        # the router uses a more aggressive threshold favouring cheaper
+        # paths, since cached state already captures context.
+        decode_mode = (L == 1)
+        macro_mask, macro_probs, _ = self.macro_router(hidden, decode_mode=decode_mode)
         use_attn = macro_mask[:, :, 0:1]
         use_eff = macro_mask[:, :, 1:2]
         use_cheap = macro_mask[:, :, 2:3]

@@ -4,7 +4,7 @@
 
 **Difficulty-Aware Mixture-of-Experts merging, with native MLX inference on Apple Silicon.**
 
-[![Version](https://img.shields.io/badge/version-2026.07.4.4.0-blue)](./PATCH_NOTES.md)
+[![Version](https://img.shields.io/badge/version-2026.07.4.5.0-blue)](./PATCH_NOTES.md)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Status](https://img.shields.io/badge/status-research%20prototype-orange)](#known-limitations)
