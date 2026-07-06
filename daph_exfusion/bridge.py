@@ -27,6 +27,11 @@ def validate_architecture_compatibility(state_dict: dict, mlx_model: nn.Module, 
         with no PT source.  A single missing projection weight produces
         nonsense inference but went unnoticed under the old ``continue``.
       * Shape mismatches — including the (out, in) vs (in, out) transpose case.
+
+    Returns the cleaned (and transposed) state dict on success (truthy), or
+    ``False`` on failure under ``raise_on_mismatch=False``.  Callers can
+    reuse the returned state dict for loading, avoiding a second
+    clean/transpose pass.
     """
     mlx_parameters = _mlx_flat_parameters(mlx_model)
     cleaned_state = clean_pytorch_keys(state_dict)
@@ -75,7 +80,7 @@ def validate_architecture_compatibility(state_dict: dict, mlx_model: nn.Module, 
                 raise RuntimeError(mismatch_msg)
             return False
 
-    return True
+    return cleaned_state
 
 
 def load_mlx_model(pytorch_module: torch.nn.Module, mlx_model: nn.Module, quantize: bool = False, strict: bool = True) -> nn.Module:
@@ -86,31 +91,30 @@ def load_mlx_model(pytorch_module: torch.nn.Module, mlx_model: nn.Module, quanti
     warnings and the load is **aborted** — the MLX model retains its
     initialized weights rather than silently loading a partial state dict
     that would produce nonsense inference.
+
+    Reuses the cleaned and transposed state dict from
+    ``validate_architecture_compatibility`` to avoid a second clean/transpose
+    pass that could diverge from the validated state.
     """
     pt_state = pytorch_module.state_dict()
 
     # Defensive structural assertions.  Under strict=False this returns False
     # (with a warning) instead of raising; we must not proceed to load weights
     # if validation failed, as that would silently produce a broken model.
-    ok = validate_architecture_compatibility(pt_state, mlx_model, raise_on_mismatch=strict)
-    if not ok and not strict:
+    # validate_architecture_compatibility returns the cleaned (and transposed)
+    # state dict on success, or False on failure.
+    cleaned_state = validate_architecture_compatibility(pt_state, mlx_model, raise_on_mismatch=strict)
+    if not cleaned_state and not strict:
         warnings.warn(
             "load_mlx_model: validation failed under strict=False; "
             "aborting weight transfer to avoid silent corruption."
         )
         return mlx_model
 
-    cleaned_state = clean_pytorch_keys(pt_state)
     mlx_weights = []
 
     for k, v in cleaned_state.items():
         arr = mx.array(v.detach().cpu().numpy())
-        # Address possible matrix transpose cases during numpy allocation
-        mlx_params = dict(mlx_model.parameters())
-        mlx_param = mlx_params.get(k)
-        if mlx_param is not None and arr.shape != mlx_param.shape:
-            if arr.shape == (mlx_param.shape[1], mlx_param.shape[0]):
-                arr = arr.T
         mlx_weights.append((k, arr))
 
     mlx_model.load_weights(mlx_weights, strict=False)

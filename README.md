@@ -4,7 +4,7 @@
 
 **Difficulty-Aware Mixture-of-Experts merging, with native MLX inference on Apple Silicon.**
 
-[![Version](https://img.shields.io/badge/version-2026.07.4.2.1-blue)](./PATCH_NOTES.md)
+[![Version](https://img.shields.io/badge/version-2026.07.4.3.7-blue)](./PATCH_NOTES.md)
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue)](./pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 [![Status](https://img.shields.io/badge/status-research%20prototype-orange)](#known-limitations)
@@ -116,7 +116,7 @@ load_mlx_model(pytorch_module, mlx_model, strict=True)  # raises on any mismatch
 | `DAPHDecoderLayer` | Static softmax blending (always computes all paths) | Baseline, deterministic latency |
 | `DAPHDecoderLayerV2` | **Adaptive top-p** (difficulty-modulated threshold, computes only selected paths) | Dynamic inference, variable latency |
 
-**Adaptive top-p routing** predicts input difficulty per token. Higher difficulty → lower cumulative-probability threshold → more paths active. Easy tokens may use only the cheap FNet path; hard tokens activate attention + ExFusion + cheap.
+**Adaptive top-p routing** predicts input difficulty per token. Higher difficulty → higher cumulative-probability threshold → more paths active (more probability mass must be accumulated). Easy tokens may use only the cheap FNet path; hard tokens activate attention + ExFusion + cheap.
 
 Expert Choice is not used at the macro level (only 3 paths, qualitatively different compute types).
 

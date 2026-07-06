@@ -1,5 +1,69 @@
 # Patch Notes
 
+## v4.3.7 — SSM Broadcasting Fix & Bridge/Release Hygiene (2026-07-05)
+
+Five fixes addressing the deep architectural audit of v4.3.6.
+
+### 1. MLX SSM Broadcasting Bug (Critical, B>1)
+
+The d_state-aware SSM code used `delta * a[:, None]` to compute the decay
+factor for the `(B, D, d_state)` state. This broadcasting pattern fails
+for `B > 1` when `B != D`: `(B, D) * (D, 1)` cannot be right-aligned.
+
+Fix: replaced with `(delta * a)[:, :, None]` which correctly broadcasts
+`(B, D) * (D,)` → `(B, D)`, then expands to `(B, D, 1)` for the d_state
+dimension. Applied in three locations:
+- `mamba_selective_scan_reference` (reference scan)
+- `test_scan_correctness` (h_last verification loop)
+- `MLXStatefulDAPHDecoderLayer.__call__` (single-token decode path)
+
+Also updated `_ssm_prefill_step` and `ssm_prefill_loop` (dead code, used
+only in tests) to use the new `(B, D, d_state)` state shape with correct
+broadcasting.
+
+### 2. Bridge Validation Returns Cleaned State
+
+`validate_architecture_compatibility` transposed tensors in its local
+`cleaned_state` copy, but `load_mlx_model` called `clean_pytorch_keys`
+again and re-discovered transposes independently. The validated transpose
+fix was lost.
+
+Fix: `validate_architecture_compatibility` now returns the cleaned (and
+transposed) state dict on success instead of `True`. `load_mlx_model`
+reuses this validated state directly, eliminating the divergent second
+clean/transpose pass. Backward compatible: a non-empty dict is truthy,
+and `False` is still returned on failure.
+
+### 3. Batch-Size-2 MLX Regression Tests
+
+Added two new tests to guard against B>1 SSM broadcasting regressions:
+- `test_stateful_mamba_decode_batch2`: pre-fills with B=2, then
+  single-token decodes with B=2, verifying no NaNs from broadcasting
+  failures.
+- `test_mamba_selective_scan_batch2`: verifies the fused Metal kernel
+  matches the Python reference for B=2 with d_state=16.
+
+Also fixed `test_stateful_decoder_with_cache` to pass `d_state=16` to
+`SSMState` (was using the default parameter).
+
+### 4. README Version & Documentation Fix
+
+- Updated version badge from `2026.07.4.2.1` to `2026.07.4.3.7`.
+- Fixed backwards router documentation: "higher difficulty → lower
+  threshold" corrected to "higher difficulty → higher threshold → more
+  paths active" (matching the v4.3.4 formula fix).
+
+### 5. Pycache Cleanup
+
+Removed all `__pycache__/` directories and `*.pyc` files from the
+repository tree. The `.gitignore` already excludes them.
+
+### Test results
+
+- **63 passed, 0 failed** — 2 new B>1 regression tests added.
+
+---
+
 ## v4.3.6 — Runtime Safety Guards (2026-07-05)
 
 Two defensive guards to ensure absolute runtime safety in production

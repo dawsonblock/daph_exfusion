@@ -80,23 +80,23 @@ def test_compiled_prefill_matches_reference():
 
     # Note: do NOT set mx.set_default_device(mx.cpu) here — it would break
     # subsequent metal kernel tests that require the GPU.
-    B, L, D = 2, 4, 8
+    B, L, D, d_state = 2, 4, 8, 16
     a = -mx.exp(mx.random.normal((D,)))
     delta = mx.random.normal((B, L, D))
-    Bc = mx.random.normal((B, L, D))
+    Bc = mx.random.normal((B, L, d_state))
     u = mx.random.normal((B, L, D))
 
     # Final state via the compiled-step loop.
-    state0 = mx.zeros((B, D))
+    state0 = mx.zeros((B, D, d_state))
     final_compiled = ssm_prefill_loop(delta, Bc, u, a, state0)
 
     # Final state via the reference loop (re-derive state from its recurrence;
     # mamba_selective_scan_reference returns per-step outputs, so we replay the
     # same recurrence here in pure Python to get the final state).
-    state_ref = mx.zeros((B, D))
+    state_ref = mx.zeros((B, D, d_state))
     for t in range(L):
-        decay = mx.exp(delta[:, t, :] * a)
-        state_ref = decay * state_ref + delta[:, t, :] * Bc[:, t, :] * u[:, t, :]
+        decay = mx.exp((delta[:, t, :] * a)[:, :, None])  # (B, D, 1)
+        state_ref = decay * state_ref + delta[:, t, :, None] * Bc[:, t, None, :] * u[:, t, :, None]
 
     assert np.allclose(np.array(final_compiled), np.array(state_ref), atol=1e-6), (
         f"Compiled pre-fill diverged from reference: "

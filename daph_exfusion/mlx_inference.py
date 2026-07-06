@@ -158,8 +158,9 @@ def mamba_selective_scan_reference(delta: mx.array, A_log: mx.array, B: mx.array
         Ct = C[:, t, :]      # (B, d_state)
         xt = x[:, t, :]      # (B, D)
 
-        # decay: (B, D) — broadcast over d_state
-        decay = mx.exp(dt * a[:, None])  # (B, D, 1) via broadcasting
+        # decay: (B, D, 1) — broadcast over d_state
+        # delta * a correctly broadcasts (B,D)*(D,)→(B,D), then expand for d_state
+        decay = mx.exp((dt * a)[:, :, None])  # (B, D, 1)
         # state = decay * state + dt * Bt * xt
         # dt: (B, D), Bt: (B, d_state), xt: (B, D)
         # contribution: (B, D, d_state) = dt[:,:,None] * Bt[:,None,:] * xt[:,:,None]
@@ -181,9 +182,16 @@ def _ssm_prefill_step(state: mx.array, dt: mx.array, Bt: mx.array,
     the Python loop remains (the sequential scan has a data dependency
     across timesteps) but each iteration is now one compiled kernel call
     rather than a chain of eager allocations.
+
+    Args:
+        state: (B, D, d_state)
+        dt: (B, D) — discretization step
+        Bt: (B, d_state) — input-dependent B
+        xt: (B, D) — input
+        a: (D,) — diagonal A
     """
-    decay = mx.exp(dt * a)
-    return decay * state + dt * Bt * xt
+    decay = mx.exp((dt * a)[:, :, None])  # (B, D, 1)
+    return decay * state + dt[:, :, None] * Bt[:, None, :] * xt[:, :, None]
 
 
 def ssm_prefill_loop(delta: mx.array, Bc: mx.array, u: mx.array,
@@ -192,7 +200,11 @@ def ssm_prefill_loop(delta: mx.array, Bc: mx.array, u: mx.array,
 
     Equivalent to ``mamba_selective_scan_reference``'s state recurrence but
     without computing per-step outputs (the pre-fill path only needs the
-    final state).  Returns the final ``state`` of shape ``(B, D)``.
+    final state).  Returns the final ``state`` of shape ``(B, D, d_state)``.
+
+    Args:
+        delta: (B, L, D), Bc: (B, L, d_state), u: (B, L, D)
+        a: (D,), state: (B, D, d_state)
     """
     L = int(u.shape[1])
     for t in range(L):
@@ -221,7 +233,7 @@ def test_scan_correctness(B: int = 2, L: int = 8, D: int = 16, d_state: int = 16
     a = -mx.exp(A_log)
     state_ref = mx.zeros((B, D, d_state))
     for t in range(L):
-        decay = mx.exp(delta[:, t, :] * a[:, None])  # (B, D, 1)
+        decay = mx.exp((delta[:, t, :] * a)[:, :, None])  # (B, D, 1)
         state_ref = decay * state_ref + delta[:, t, :, None] * Bv[:, t, None, :] * x[:, t, :, None]
     h_match = np.allclose(np.array(state_ref), np.array(h_last), atol=atol)
 
@@ -830,8 +842,9 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
             # Compute decay factor and update recurrent state.
             # State has shape (B, D, d_state).
             # decay: (B, D, 1) — broadcast over d_state
+            # delta * a correctly broadcasts (B,D)*(D,)→(B,D), then expand for d_state
             a = -mx.exp(self.mamba_path.A_log)  # (D,)
-            decay = mx.exp(delta * a[:, None])  # (B, D, 1) via broadcasting
+            decay = mx.exp((delta * a)[:, :, None])  # (B, D, 1)
             # contribution: dt[:,:,None] * Bt[:,None,:] * xt[:,:,None]
             h_new = decay * ssm_state.h + delta[:, :, None] * Bc[:, None, :] * u_sq[:, :, None]
             ssm_state.update(h_new)

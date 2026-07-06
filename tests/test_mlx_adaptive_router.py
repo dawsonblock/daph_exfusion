@@ -95,8 +95,60 @@ def test_stateful_decoder_with_cache():
     )
     x = mx.random.normal((B, L, D))
     cache = KVCache()
-    ssm = SSMState(B, D)
+    ssm = SSMState(B, D, d_state=16)
 
     out = layer(x, kv_cache=cache, ssm_state=ssm)
     assert out.shape == (B, L, D)
     assert cache.keys is not None
+
+
+def test_stateful_mamba_decode_batch2():
+    """Regression test for B>1 SSM broadcasting bug in single-token decode.
+
+    The single-step decode path uses ``delta * a`` broadcasting to compute
+    the decay factor for the (B, D, d_state) state.  This previously used
+    ``delta * a[:, None]`` which fails for B > 1 when B != D.  This test
+    exercises the exact code path with B=2 to guard against regressions.
+    """
+    B, L, D = 2, 4, 16
+    layer = MLXStatefulDAPHDecoderLayer(
+        hidden_size=D,
+        intermediate_size=D * 2,
+        num_heads=4,
+    )
+    # Pre-fill with L>1 to populate caches and SSM state
+    x_prefill = mx.random.normal((B, L, D))
+    cache = KVCache()
+    ssm = SSMState(B, D, d_state=16)
+    out_prefill = layer(x_prefill, kv_cache=cache, ssm_state=ssm)
+    assert out_prefill.shape == (B, L, D)
+
+    # Single-token decode with B=2 — this is the path that had the broadcasting bug
+    x_decode = mx.random.normal((B, 1, D))
+    out_decode = layer(x_decode, kv_cache=cache, ssm_state=ssm)
+    assert out_decode.shape == (B, 1, D)
+    # Verify no NaNs from broadcasting failures
+    assert not np.any(np.isnan(np.array(out_decode)))
+
+
+def test_mamba_selective_scan_batch2():
+    """Verify the fused Metal kernel matches the reference for B>1."""
+    from daph_exfusion.mlx_inference import (
+        mamba_selective_scan,
+        mamba_selective_scan_reference,
+    )
+    B, L, D, d_state = 2, 8, 16, 16
+    delta = mx.random.normal((B, L, D))
+    A_log = mx.random.normal((D,))
+    Bv = mx.random.normal((B, L, d_state))
+    C = mx.random.normal((B, L, d_state))
+    Dv = mx.random.normal((D,))
+    x = mx.random.normal((B, L, D))
+
+    y_ref = np.array(mamba_selective_scan_reference(delta, A_log, Bv, C, Dv, x))
+    y_ker, h_last = mamba_selective_scan(delta, A_log, Bv, C, Dv, x)
+
+    assert np.array(y_ker).shape == (B, L, D)
+    assert np.array(h_last).shape == (B, D, d_state)
+    # Use relative tolerance since SSM values can be large
+    assert np.allclose(y_ref, np.array(y_ker), rtol=1e-4, atol=1e-5)
