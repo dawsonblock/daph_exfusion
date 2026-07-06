@@ -147,12 +147,17 @@ class KFACConfig:
     #   diagonal_only=False, block_size=B — block-diagonal E[a a^T] with B-sized
     #     blocks (O(dim * B) memory).  At D=4096, B=128: ~2 MB vs ~1.6 GB full.
     #     Preserves localized bilinear curvature within each block.
+    #   low_rank=True — store rank-k approximation U @ diag(s) @ U^T
+    #     (O(dim * k) memory).  Captures dominant global curvature directions,
+    #     useful for SSM A_log/D parameters at large hidden sizes.
     diagonal_only: bool = True
     block_size: Optional[int] = 128
+    low_rank: bool = False
+    rank: int = 32
 
 
 class RunningCovariance:
-    """Running EMA of a covariance estimate, supporting three storage modes.
+    """Running EMA of a covariance estimate, supporting four storage modes.
 
     Accepts raw activations ``x`` of shape ``(samples, dim)`` and computes the
     appropriate covariance representation internally:
@@ -162,17 +167,29 @@ class RunningCovariance:
       ``(num_blocks, B, B)`` — block-wise E[a a^T].  The last block is padded
       if ``dim`` is not divisible by ``B``.
     - **full** (``diagonal_only=False, block_size=None``): stores ``(dim, dim)``.
+    - **low-rank** (``low_rank=True``): stores ``(dim, rank)`` U and
+      ``(rank,)`` s such that the covariance is approximated as
+      ``U @ diag(s) @ U^T``.  O(dim * rank) memory.  Captures dominant
+      global curvature directions, useful for SSM A_log/D at large D.
     """
 
     def __init__(self, dim: int, decay: float = 0.95, *,
                  diagonal_only: bool = True, block_size: Optional[int] = 128,
+                 low_rank: bool = False, rank: int = 32,
                  device=None, dtype=torch.float32):
         self.decay = decay
         self.diagonal_only = diagonal_only
         self.block_size = block_size
+        self.low_rank = low_rank
+        self.rank = min(rank, dim)
         self.dim = dim
 
-        if diagonal_only:
+        if low_rank:
+            self.mode = "low_rank"
+            # U: (dim, rank) orthonormal columns, s: (rank,) eigenvalues
+            self.U = torch.zeros(dim, self.rank, device=device, dtype=dtype)
+            self.s = torch.zeros(self.rank, device=device, dtype=dtype)
+        elif diagonal_only:
             self.mode = "diagonal"
             self.value = torch.zeros(dim, device=device, dtype=dtype)
         elif block_size is not None and block_size < dim:
@@ -195,8 +212,74 @@ class RunningCovariance:
         x = x.detach().float()
         samples = max(x.shape[0], 1)
 
-        if self.mode == "diagonal":
+        if self.mode == "low_rank":
+            # Compute the batch covariance, then merge with the stored
+            # rank-k approximation via SVD of the combined factor.
+            # Batch covariance: (dim, dim) = x^T @ x / samples
+            # But we don't materialize the full matrix.  Instead:
+            # 1. Project x onto current U to get the within-subspace covariance
+            # 2. Compute the residual and its top components
+            # 3. SVD the combined representation to get the new top-k
+            k = self.rank
+            if not self.initialized:
+                # Initialize from the first batch's SVD.
+                # x: (S, D).  We want the right singular vectors of x,
+                # which are the eigenvectors of x^T @ x (the covariance).
+                # SVD of x gives U_x (S, min(S,D)), s_x, V_x^T (min(S,D), D).
+                # V_x^T rows are the right singular vectors → eigenvectors of cov.
+                _, s_svd, Vh = torch.linalg.svd(x, full_matrices=False)
+                # Vh: (min(S,D), D), rows are right singular vectors
+                # We need columns: V_x = Vh^T → (D, min(S,D))
+                V_x = Vh.t()  # (D, min(S,D))
+                actual_k = min(k, V_x.shape[1])
+                U_partial = V_x[:, :actual_k].to(self.U.dtype)
+                s_partial = (s_svd[:actual_k] ** 2) / samples
+                # Pad U with zero columns and s with zeros to reach target rank k.
+                # This ensures U always has shape (dim, rank) even when the first
+                # batch has fewer samples than rank.
+                if actual_k < k:
+                    U_pad = torch.zeros(self.U.shape[0], k - actual_k,
+                                        device=self.U.device, dtype=self.U.dtype)
+                    self.U = torch.cat([U_partial, U_pad], dim=1)
+                    self.s = torch.cat([
+                        s_partial,
+                        torch.zeros(k - actual_k, device=self.s.device, dtype=self.s.dtype)
+                    ])
+                else:
+                    self.U = U_partial
+                    self.s = s_partial
+                self.initialized = True
+            else:
+                # EMA update: new_cov = decay * old + (1-decay) * batch_cov
+                # In rank-k form: combine old (U, s) with new samples
+                # Scale old by decay
+                s_old = self.s * self.decay
+                # Project new samples onto complement of U
+                x_proj = x @ self.U  # (S, k)
+                x_resid = x - x_proj @ self.U.t()  # (S, D) residual
+                # Orthonormalize residual via QR
+                Q_resid, R_resid = torch.linalg.qr(x_resid.t(), mode='reduced')
+                # Q_resid: (D, min(S, D)), take at most k columns
+                Q_resid = Q_resid[:, :k]
+                R_resid = R_resid[:k, :]  # (k, S)
+                # Combined basis: [U * sqrt(s_old), Q_resid * R_resid * sqrt(1-decay)/sqrt(S)]
+                scale_old = s_old.sqrt().unsqueeze(0)  # (1, k)
+                scale_new = ((1.0 - self.decay) / samples).sqrt()
+                B = torch.cat([
+                    self.U * scale_old,           # (D, k) scaled old eigenvectors
+                    Q_resid * (R_resid * scale_new),  # (D, k) scaled new residual
+                ], dim=1)  # (D, 2k)
+                # SVD of B to get new top-k
+                U_new, s_new, _ = torch.linalg.svd(B, full_matrices=False)
+                self.U = U_new[:, :k]
+                self.s = s_new[:k] ** 2  # eigenvalues of covariance
+        elif self.mode == "diagonal":
             cov = (x * x).sum(0) / samples
+            if not self.initialized:
+                self.value.copy_(cov)
+                self.initialized = True
+            else:
+                self.value.mul_(self.decay).add_(cov, alpha=(1.0 - self.decay))
         elif self.mode == "block":
             bs = self.block_size
             nb = self.num_blocks
@@ -207,21 +290,31 @@ class RunningCovariance:
             x_blocks = padded.view(samples, nb, bs).permute(1, 0, 2)  # (nb, S, B)
             # cov per block: (nb, B, B) = x_blocks^T @ x_blocks
             cov = torch.bmm(x_blocks.transpose(1, 2), x_blocks) / samples
+            if not self.initialized:
+                self.value.copy_(cov)
+                self.initialized = True
+            else:
+                self.value.mul_(self.decay).add_(cov, alpha=(1.0 - self.decay))
         else:  # full
             cov = (x.t() @ x) / samples
-
-        if not self.initialized:
-            self.value.copy_(cov)
-            self.initialized = True
-        else:
-            self.value.mul_(self.decay).add_(cov, alpha=(1.0 - self.decay))
+            if not self.initialized:
+                self.value.copy_(cov)
+                self.initialized = True
+            else:
+                self.value.mul_(self.decay).add_(cov, alpha=(1.0 - self.decay))
 
     def get(self) -> torch.Tensor:
+        if self.mode == "low_rank":
+            # Reconstruct the approximate covariance matrix
+            return self.U @ torch.diag(self.s) @ self.U.t()
         return self.value
 
     def diagonal(self) -> torch.Tensor:
         """Return the full diagonal as a 1D ``(dim,)`` tensor in any mode."""
-        if self.mode == "diagonal":
+        if self.mode == "low_rank":
+            # diag(U @ diag(s) @ U^T) = (U^2) @ s
+            return (self.U ** 2) @ self.s
+        elif self.mode == "diagonal":
             return self.value
         elif self.mode == "block":
             bs = self.block_size
@@ -275,12 +368,16 @@ class KFACFisherTracker:
                 in_dim, decay=self.config.ema_decay,
                 diagonal_only=self.config.diagonal_only,
                 block_size=self.config.block_size,
+                low_rank=self.config.low_rank,
+                rank=self.config.rank,
                 device=module.weight.device, dtype=torch.float32,
             )
             self.g_factors[name] = RunningCovariance(
                 out_dim, decay=self.config.ema_decay,
                 diagonal_only=self.config.diagonal_only,
                 block_size=self.config.block_size,
+                low_rank=self.config.low_rank,
+                rank=self.config.rank,
                 device=module.weight.device, dtype=torch.float32,
             )
 
@@ -318,27 +415,61 @@ class KFACFisherTracker:
 
     @torch.no_grad()
     def get_factors(self, layer_name: str):
-        A = self.a_factors[layer_name].get()
-        G = self.g_factors[layer_name].get()
+        a_cov = self.a_factors[layer_name]
+        g_cov = self.g_factors[layer_name]
         d = self.config.damping
-        if A.dim() == 1:
-            # Diagonal-only mode: damping is added elementwise.
-            A = A + d
-            G = G + d
-        elif A.dim() == 3:
-            # Block-diagonal mode: add damping to each block's diagonal.
-            nb, bs, _ = A.shape
-            eye = torch.eye(bs, device=A.device, dtype=A.dtype).unsqueeze(0)  # (1, B, B)
-            A = A + d * eye
-            G = G + d * eye
+
+        if a_cov.mode == "low_rank":
+            # Low-rank mode: return (U, s) pairs and add damping to s.
+            # The caller can reconstruct U @ diag(s + d) @ U^T if needed,
+            # or use the factored form directly for efficient computation.
+            A = (a_cov.U, a_cov.s + d)
+            G = (g_cov.U, g_cov.s + d)
         else:
-            A = A + d * torch.eye(A.size(0), device=A.device, dtype=A.dtype)
-            G = G + d * torch.eye(G.size(0), device=G.device, dtype=G.dtype)
+            A = a_cov.get()
+            G = g_cov.get()
+            if A.dim() == 1:
+                # Diagonal-only mode: damping is added elementwise.
+                A = A + d
+                G = G + d
+            elif A.dim() == 3:
+                # Block-diagonal mode: add damping to each block's diagonal.
+                nb, bs, _ = A.shape
+                eye = torch.eye(bs, device=A.device, dtype=A.dtype).unsqueeze(0)  # (1, B, B)
+                A = A + d * eye
+                G = G + d * eye
+            else:
+                A = A + d * torch.eye(A.size(0), device=A.device, dtype=A.dtype)
+                G = G + d * torch.eye(G.size(0), device=G.device, dtype=G.dtype)
         return A, G
 
     @torch.no_grad()
     def layer_score(self, layer_name: str) -> float:
         A, G = self.get_factors(layer_name)
+
+        # Handle low-rank factored form: A = (U, s), G = (U_g, s_g)
+        if isinstance(A, tuple):
+            U_a, s_a = A
+            U_g, s_g = G
+            # trace(U @ diag(s) @ U^T) = sum(s) since U has orthonormal columns
+            tr_a = s_a.sum()
+            tr_g = s_g.sum()
+            if self.config.score_mode == "trace":
+                score = tr_a * tr_g
+            elif self.config.score_mode == "log_trace":
+                score = torch.log1p(tr_a) * torch.log1p(tr_g)
+            elif self.config.score_mode == "fro":
+                # ||U @ diag(s) @ U^T||_F = ||s|| (since U is orthonormal)
+                score = s_a.norm() * s_g.norm()
+            elif self.config.score_mode == "spectral_proxy":
+                # Max eigenvalue is max(s) for the factored form
+                score = s_a.max().clamp_min(0) * s_g.max().clamp_min(0)
+            else:
+                raise ValueError(f"Unknown score_mode: {self.config.score_mode}")
+            if self.config.normalize_by_params:
+                score = score / max(self.layer_param_counts[layer_name], 1)
+            return float(score.item())
+
         ndim = A.dim()
 
         def _trace(t):
@@ -385,14 +516,18 @@ class KFACFisherTracker:
     def weight_diag_proxy(self, layer_name: str) -> torch.Tensor:
         """diag(G kron A) = outer(diag(G), diag(A)) reshaped to weight shape.
 
-        Works in all three storage modes (diagonal, block-diagonal, full) by
-        extracting the full diagonal via ``RunningCovariance.diagonal()``.
+        Works in all four storage modes (diagonal, block-diagonal, full,
+        low-rank) by extracting the full diagonal via
+        ``RunningCovariance.diagonal()``.
         """
         module = self.layer_modules[layer_name]
         A, G = self.get_factors(layer_name)
 
-        # Extract the full diagonal regardless of storage mode.
-        if A.dim() == 1:
+        # Handle low-rank factored form
+        if isinstance(A, tuple):
+            diag_a = self.a_factors[layer_name].diagonal() + self.config.damping
+            diag_g = self.g_factors[layer_name].diagonal() + self.config.damping
+        elif A.dim() == 1:
             diag_a = A
             diag_g = G
         elif A.dim() == 3:

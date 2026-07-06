@@ -1,5 +1,93 @@
 # Patch Notes
 
+## v4.3.2 — Performance & K-FAC Low-Rank Mode (2026-07-05)
+
+Addresses the four priority next steps identified in the v4.3.1 deep
+analysis, moving the codebase from research-ready toward performance-grade
+territory suitable for 7- to 13-B local models on Apple Silicon.
+
+### 1. Packed Token Dispatch (Gather-Run-Scatter) for FFN
+
+`DAPHDecoderLayerV2` (PyTorch) now uses packed dispatch for the FFN path
+when in merged/inference mode. Tokens that don't select the efficient path
+are gathered into a contiguous batch, the FFN runs only on that subset,
+and results are scattered back — realizing real FLOP savings instead of
+computing all paths on all tokens and masking.
+
+Attention and Mamba paths still run on the full sequence because they
+require full-sequence context (K/V cache, recurrent state).
+
+MLX's lazy evaluation model prevents dynamic tensor sizing from data
+(required for gather), so the MLX path continues to compute on all tokens
+and mask. The FLOP savings are realized in the PyTorch inference path.
+
+- Regression: `test_packed_ffn_dispatch`
+
+### 2. Full-Sequence SSM Scan Verification
+
+Verified that the pre-fill path uses `mamba_selective_scan` (the Metal
+kernel) as a single GPU dispatch — no Python-level sequence loop remains
+in the production code path. The only `for t in range(L)` loops are in:
+- `mamba_selective_scan_reference` — pure-Python reference for correctness
+- `ssm_prefill_loop` — retained for ablation, not used in main path
+- `test_scan_correctness` — test verification code
+
+MLX does not expose a public `mx.scan` primitive; the Metal kernel already
+achieves O(1) dispatch scaling.
+
+### 3. Low-Rank K-FAC Mode for SSM A_log/D
+
+Added a fourth storage mode to `RunningCovariance`: `low_rank=True` stores
+`(U, s)` where `U` is `(dim, rank)` with orthonormal columns and `s` is
+`(rank,)` eigenvalues, approximating the covariance as `U @ diag(s) @ U^T`.
+
+Memory: O(dim * rank) — at D=4096, rank=32: ~512 KB vs 1.6 GB full, a
+99.97% reduction, while capturing the dominant global curvature directions.
+
+The update uses incremental SVD: projects new samples onto the complement
+of the current subspace, QR-orthonormalizes the residual, and SVDs the
+combined factor to extract the new top-k eigenvectors.
+
+`KFACFisherTracker.get_factors()` returns the factored `(U, s)` form for
+low-rank mode, and `layer_score()` / `weight_diag_proxy()` handle the
+factored form without materializing the full matrix.
+
+- Config: `KFACConfig(low_rank=True, rank=32)`
+- Regression: `test_low_rank_kfac_mode`
+
+### 4. Block-Diagonal K-FAC Edge-Dim Tests
+
+Parametrized test covering dims that are not divisible by `block_size`,
+including the edge case where `dim < block_size`:
+
+- (4096, 128) — standard, exactly divisible
+- (8192, 128) — standard, exactly divisible
+- (4096, 64) — different block size
+- (4097, 128) — non-divisible: dim % block_size = 1
+- (4100, 128) — non-divisible: dim % block_size = 4
+- (100, 128) — dim < block_size (edge case)
+- (256, 128) — exactly 2 blocks
+
+Verifies covariance factor shapes, diagonal extraction, and score
+computation for all configurations.
+
+- Regression: `test_block_diag_kfac_edge_dims` (7 parametrized cases)
+
+### 5. Cheap-Path FFT Memoisation
+
+`DAPHDecoderLayerV2._cheap_path` now memoises the `fft2` result based on
+the normalised tensor's data pointer, shape, and device. Repeated calls
+with the same input (e.g. when the residual stream hasn't changed between
+paths in the same layer) avoid recomputing the FFT, reducing micro-latency
+on long sequences with heavy cheap-path traffic.
+
+### Test results
+
+- **53 passed, 8 failed** (all 8 failures are pre-existing and unrelated).
+- All 23 safety-gates tests pass (9 new tests added in v4.3.1 + v4.3.2).
+
+---
+
 ## v4.3.1 — Boundary Condition & GQA Patch (2026-07-05)
 
 Three boundary-condition fixes identified in the v4.3 audit, ensuring

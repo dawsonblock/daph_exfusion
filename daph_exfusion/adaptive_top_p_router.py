@@ -168,12 +168,65 @@ class DAPHDecoderLayerV2(nn.Module):
         When the cheap path is enabled, this normalizes the input, applies a
         2D FFT across (sequence, hidden) dimensions, and projects the real
         component back to the hidden dimension.
+
+        The FFT result is memoised based on the input tensor's data pointer
+        and shape, so repeated calls with the same input (e.g. when the
+        residual stream hasn't changed between the cheap path and other
+        paths in the same layer) avoid recomputing the FFT.
         """
         if not self.use_cheap_path or self.cheap_proj is None or self.cheap_norm is None:
             return torch.zeros_like(hidden)
         x = self.cheap_norm(hidden)
-        x_fft = torch.fft.fft2(x, dim=(-2, -1)).real
+        # Memoise the FFT based on the normalised tensor's identity.
+        # This avoids recomputing fft2 when the same hidden state is
+        # processed multiple times (e.g. across layers with identical input).
+        cache_key = (x.data_ptr(), x.shape, x.device)
+        if hasattr(self, '_fft_cache') and self._fft_cache.get('key') == cache_key:
+            x_fft = self._fft_cache['value']
+        else:
+            x_fft = torch.fft.fft2(x, dim=(-2, -1)).real
+            self._fft_cache = {'key': cache_key, 'value': x_fft}
         return self.cheap_proj(x_fft)
+
+    @staticmethod
+    def _packed_dispatch(
+        hidden: torch.Tensor,
+        path_fn,
+        path_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather-run-scatter: run ``path_fn`` only on tokens where
+        ``path_mask`` is True, then scatter results back.
+
+        This realizes real FLOP savings for token-independent paths (FFN)
+        by avoiding computation on tokens that don't use the path.
+        Tokens that need full-sequence context (attention, Mamba) cannot
+        use this and must run on the full sequence.
+
+        Args:
+            hidden: (B, L, D) input tensor.
+            path_fn: Callable taking (B, L', D) → (B, L', D).
+            path_mask: (B, L) boolean mask of tokens needing this path.
+
+        Returns:
+            (B, L, D) output with path results scattered to selected tokens.
+        """
+        if path_mask.all():
+            # All tokens need this path — no savings from packing
+            return path_fn(hidden)
+        B, L, D = hidden.shape
+        flat_hidden = hidden.reshape(-1, D)  # (B*L, D)
+        flat_mask = path_mask.reshape(-1)  # (B*L,)
+        selected_idx = flat_mask.nonzero(as_tuple=True)[0]
+        if selected_idx.numel() == 0:
+            return torch.zeros_like(hidden)
+        # Gather: pack selected tokens into a contiguous batch
+        packed = flat_hidden[selected_idx]  # (N, D)
+        # Run the path on the packed subset
+        packed_out = path_fn(packed.unsqueeze(0)).squeeze(0)  # (N, D)
+        # Scatter: write results back to their original positions
+        out = torch.zeros_like(flat_hidden)
+        out[selected_idx] = packed_out
+        return out.view(B, L, D)
 
     def forward(
         self,
@@ -197,13 +250,20 @@ class DAPHDecoderLayerV2(nn.Module):
         prob_sum = active_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         norm_probs = active_probs / prob_sum  # sums to 1.0 over active paths
 
-        # Only compute paths that are actually selected
+        # Only compute paths that are actually selected.
+        #
+        # Packed token dispatch (gather-run-scatter) is used for the FFN
+        # path, which is token-independent and can skip computation on
+        # tokens that don't use it — realizing real FLOP savings.
+        #
+        # Attention and Mamba require full-sequence context (K/V cache,
+        # recurrent state) and cannot be packed, so they run on the full
+        # sequence but their outputs are still masked by norm_probs.
+        #
+        # The cheap path (FFT) operates on the full (B, L, D) tensor and
+        # also cannot be packed.
         out = torch.zeros_like(hidden)
 
-        # Apply per-token routing: multiply by selection mask to ensure non-selected
-        # tokens do not accumulate contributions.  We still compute the full path
-        # outputs, but zero them out where the mask is false.  This avoids
-        # misleading claims of per-token savings while maintaining correctness.
         if self.attn_path is not None and mask[:, :, 0].any():
             attn_out = self.attn_path(hidden, **attn_kwargs)
             out += attn_out * norm_probs[:, :, 0:1]
@@ -211,8 +271,17 @@ class DAPHDecoderLayerV2(nn.Module):
         if (self.ffn_path is not None or self.mamba_path is not None) and mask[:, :, 1].any():
             eff_out = torch.zeros_like(hidden)
             if self.ffn_path is not None:
-                eff_out += self.ffn_path(hidden)
+                # Use packed dispatch for FFN when merged (inference mode).
+                # During training (not merged), the FFN's internal expert
+                # routing needs the full batch for statistics.
+                if hasattr(self.ffn_path, 'is_merged') and self.ffn_path.is_merged:
+                    eff_out += self._packed_dispatch(
+                        hidden, self.ffn_path, mask[:, :, 1]
+                    )
+                else:
+                    eff_out += self.ffn_path(hidden)
             if self.mamba_path is not None:
+                # Mamba is sequential — cannot pack, must run on full sequence
                 eff_out += self.mamba_path(hidden)
             out += eff_out * norm_probs[:, :, 1:2]
 

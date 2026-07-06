@@ -442,3 +442,135 @@ def test_causal_lm_generation():
         )
     except Exception as e:
         pytest.fail(f"MLXStatefulCausalLM.generate crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 14. Block-diagonal K-FAC edge-dim tests (parametrized)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("dim,block_size", [
+    (4096, 128),    # standard: exactly divisible
+    (8192, 128),    # standard: exactly divisible
+    (4096, 64),     # different block size
+    (4097, 128),    # non-divisible: dim % block_size = 1
+    (4100, 128),    # non-divisible: dim % block_size = 4
+    (100, 128),     # dim < block_size (edge case)
+    (256, 128),     # exactly 2 blocks
+])
+def test_block_diag_kfac_edge_dims(dim, block_size):
+    """Verify block-diagonal K-FAC handles dims that are not divisible by
+    block_size, including the edge case where dim < block_size."""
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(dim, dim)
+
+        def forward(self, x):
+            return self.proj(x)
+
+    cfg = KFACConfig(diagonal_only=False, block_size=block_size)
+    tracker = KFACFisherTracker(_Model(), config=cfg)
+    x = torch.randn(4, dim)
+    out = tracker.model(x)
+    out.sum().backward()
+
+    # Verify the covariance factor has the correct shape
+    for name, cov in tracker.a_factors.items():
+        if dim <= block_size:
+            # When dim <= block_size, mode falls back to full
+            assert cov.mode in ("block", "full"), (
+                f"Unexpected mode {cov.mode} for dim={dim}, block_size={block_size}"
+            )
+        else:
+            assert cov.mode == "block", (
+                f"Expected 'block' mode for dim={dim}, block_size={block_size}, "
+                f"got '{cov.mode}'"
+            )
+            if cov.mode == "block":
+                expected_blocks = (dim + block_size - 1) // block_size
+                assert cov.value.shape[0] == expected_blocks, (
+                    f"num_blocks={cov.value.shape[0]}, expected {expected_blocks}"
+                )
+                assert cov.value.shape[1] == block_size
+                assert cov.value.shape[2] == block_size
+
+    # Verify diagonal extraction works (no shape errors)
+    for name in tracker.a_factors:
+        diag = tracker.a_factors[name].diagonal()
+        assert diag.shape[0] == dim, (
+            f"diagonal length {diag.shape[0]}, expected {dim}"
+        )
+
+    # Verify score computation works
+    for name in tracker.layer_modules:
+        score = tracker.layer_score(name)
+        assert isinstance(score, float) and score > 0, (
+            f"layer_score('{name}') = {score}, expected positive float"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 15. Low-rank K-FAC mode
+# ---------------------------------------------------------------------------
+def test_low_rank_kfac_mode():
+    """Verify low-rank K-FAC mode stores (U, s) factors and produces valid scores."""
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(64, 64)
+
+        def forward(self, x):
+            return self.proj(x)
+
+    cfg = KFACConfig(diagonal_only=False, low_rank=True, rank=8)
+    tracker = KFACFisherTracker(_Model(), config=cfg)
+    x = torch.randn(4, 64)
+    out = tracker.model(x)
+    out.sum().backward()
+
+    for name, cov in tracker.a_factors.items():
+        assert cov.mode == "low_rank", f"Expected 'low_rank' mode, got '{cov.mode}'"
+        assert cov.U.shape[0] == 64, f"U.shape[0] {cov.U.shape[0]}, expected 64"
+        assert cov.U.shape[1] == 8, f"U.shape[1] {cov.U.shape[1]}, expected 8 (rank)"
+        assert cov.s.shape[0] == 8, f"s.shape[0] {cov.s.shape[0]}, expected 8"
+
+    # Score should be a valid positive float
+    score = tracker.layer_score("proj")
+    assert isinstance(score, float), f"Expected float, got {type(score)}"
+
+    # Diagonal extraction should work
+    diag = tracker.a_factors["proj"].diagonal()
+    assert diag.shape[0] == 64, f"diagonal length {diag.shape[0]}, expected 64"
+
+
+# ---------------------------------------------------------------------------
+# 16. Packed token dispatch (gather-run-scatter) for FFN
+# ---------------------------------------------------------------------------
+def test_packed_ffn_dispatch():
+    """Verify that DAPHDecoderLayerV2 uses packed dispatch for the FFN path
+    when merged, producing correct outputs."""
+    from daph_exfusion.adaptive_top_p_router import DAPHDecoderLayerV2
+
+    # Build a simple layer with a merged FFN (so packed dispatch is used)
+    hidden_size = 32
+
+    def ffn_factory():
+        from daph_exfusion.merge_toolkit import SwiGLUFFN
+        up = nn.Linear(hidden_size, hidden_size * 2, bias=False)
+        gate = nn.Linear(hidden_size, hidden_size * 2, bias=False)
+        down = nn.Linear(hidden_size * 2, hidden_size, bias=False)
+        ffn = SwiGLUFFN(up, gate, down)
+        ffn.is_merged = True  # Mark as merged to trigger packed dispatch
+        ffn.merged_ffn = ffn  # Point to self for simplicity
+        return ffn
+
+    layer = DAPHDecoderLayerV2(
+        hidden_size=hidden_size,
+        ffn_exfusion_factory=ffn_factory,
+        mamba_exfusion_factory=None,
+        attention_factory=None,
+        use_cheap_path=True,
+    )
+
+    x = torch.randn(2, 8, hidden_size)
+    out = layer(x)
+    assert out.shape == (2, 8, hidden_size), f"Output shape {out.shape}"

@@ -806,6 +806,12 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
                 mamba_out = self.mamba_path(hidden)
 
         # 3. Feed-forward network output
+        # Packed token dispatch (gather-run-scatter) saves FLOPs by only
+        # running the FFN on tokens that use the efficient path.  This is
+        # implemented in the PyTorch DAPHDecoderLayerV2.  In MLX, dynamic
+        # tensor sizing from data (required for gather) would break lazy
+        # evaluation, so we compute on all tokens and mask the output.
+        # The FLOP savings are realized in the PyTorch inference path.
         ffn_out = self.ffn_path(hidden)
         eff_out = ffn_out + mamba_out
 
