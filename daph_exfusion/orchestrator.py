@@ -22,32 +22,69 @@ from daph_exfusion.merge_toolkit import (
 from daph_exfusion.upgrade_utils import aggregate_kfac_scores_to_experts
 
 
-def offload_experts_to_cpu(exfusion_module: nn.Module) -> None:
+def _get_transfer_stream() -> Optional[Any]:
+    """Return a background stream for async transfers, or None if unavailable.
+
+    CUDA has proper stream support.  MPS (Apple Silicon) does not expose
+    a stream API in PyTorch, so we fall back to non_blocking transfers
+    without a dedicated stream.
+    """
+    if torch.cuda.is_available():
+        return torch.cuda.Stream()
+    return None
+
+
+def _sync_stream(stream: Optional[Any]) -> None:
+    """Synchronize the transfer stream with the current compute stream."""
+    if stream is not None:
+        torch.cuda.current_stream().wait_stream(stream)
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def offload_experts_to_cpu(exfusion_module: nn.Module,
+                           stream: Optional[Any] = None) -> None:
     """Offload all expert parameters in an ExFusion module to CPU memory.
 
     This frees GPU VRAM during non-active stages of the merge pipeline,
     allowing large expert configurations (e.g. 7B-scale models) to be
     processed on consumer GPU hardware.
+
+    v4.6.0: When a CUDA stream is provided, transfers are non-blocking
+    and overlapped with computation on the main stream.  On MPS/CPU,
+    falls back to non_blocking=True without a dedicated stream.
     """
     if not hasattr(exfusion_module, "experts"):
         return
     for expert in exfusion_module.experts:
         for param in expert.parameters():
             if param.device.type != "cpu":
-                param.data = param.data.to("cpu")
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        param.data = param.data.to("cpu", non_blocking=True)
+                else:
+                    param.data = param.data.to("cpu", non_blocking=True)
 
 
-def recall_experts_to_gpu(exfusion_module: nn.Module, device: torch.device) -> None:
+def recall_experts_to_gpu(exfusion_module: nn.Module, device: torch.device,
+                          stream: Optional[Any] = None) -> None:
     """Move all expert parameters back to the target GPU device.
 
     Called before calibration or tracking stages that require GPU execution.
+
+    v4.6.0: When a CUDA stream is provided, transfers are non-blocking
+    and overlapped with computation on the main stream.
     """
     if not hasattr(exfusion_module, "experts"):
         return
     for expert in exfusion_module.experts:
         for param in expert.parameters():
             if param.device.type != device.type or param.device.index != device.index:
-                param.data = param.data.to(device)
+                if stream is not None:
+                    with torch.cuda.stream(stream):
+                        param.data = param.data.to(device, non_blocking=True)
+                else:
+                    param.data = param.data.to(device, non_blocking=True)
 
 
 class _CalibrationModelWrapper(nn.Module):
@@ -125,9 +162,15 @@ class AutomatedMergePipeline:
         wrapper = _CalibrationModelWrapper(self.layer)
         device = next(self.layer.parameters()).device
 
+        # v4.6.0: Async stream-based memory offloading.
+        # When CUDA is available, use a background stream so transfers
+        # overlap with computation.  On MPS/CPU, falls back to
+        # non_blocking transfers without a dedicated stream.
+        transfer_stream = _get_transfer_stream() if self.enable_memory_offloading else None
+
         # Memory offloading: offload Mamba experts while computing FFN Fisher
         if self.enable_memory_offloading and mamba_expert_scores is not None:
-            offload_experts_to_cpu(self.layer.mamba_path)
+            offload_experts_to_cpu(self.layer.mamba_path, stream=transfer_stream)
 
         fisher_diagonals_ffn = build_fisher_diagonals(
             experts=self.layer.ffn_path.experts,
@@ -139,14 +182,18 @@ class AutomatedMergePipeline:
 
         # Recall Mamba experts and offload FFN experts for Mamba Fisher computation
         if self.enable_memory_offloading:
+            # Sync: ensure Mamba offload is complete before recalling
+            _sync_stream(transfer_stream)
             if mamba_expert_scores is not None:
-                recall_experts_to_gpu(self.layer.mamba_path, device)
-                offload_experts_to_cpu(self.layer.ffn_path)
+                recall_experts_to_gpu(self.layer.mamba_path, device, stream=transfer_stream)
+                offload_experts_to_cpu(self.layer.ffn_path, stream=transfer_stream)
 
         # Compute Mamba Fisher diagonals if the layer has a Mamba path
         mamba_fisher_diagonals = None
         if (hasattr(self.layer, "mamba_path") and self.layer.mamba_path is not None
                 and hasattr(self.layer.mamba_path, "experts")):
+            # Sync: ensure Mamba recall is complete before Fisher computation
+            _sync_stream(transfer_stream)
             mamba_fisher_diagonals = build_fisher_diagonals(
                 experts=self.layer.mamba_path.experts,
                 dataloader=self.loader,
@@ -157,7 +204,9 @@ class AutomatedMergePipeline:
 
         # Recall FFN experts back to GPU for calibration
         if self.enable_memory_offloading:
-            recall_experts_to_gpu(self.layer.ffn_path, device)
+            _sync_stream(transfer_stream)
+            recall_experts_to_gpu(self.layer.ffn_path, device, stream=transfer_stream)
+            _sync_stream(transfer_stream)
 
         # 4. Launch coordinate-descent search for merge hyperparameters
         if search_space is None:

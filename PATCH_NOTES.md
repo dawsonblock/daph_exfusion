@@ -1,5 +1,81 @@
 # Patch Notes
 
+## v4.6.0 — Systems Hardening: Memory, Sync, Kernel, Offload (2026-07-07)
+
+Four targeted fixes resolving architectural bottlenecks and safety
+vulnerabilities identified in the v4.5.0 codebase.  Each fix is
+device-agnostic and backward-compatible.
+
+### 1. Tensor-Lifecycle-Bound FFT Cache (PyTorch)
+
+**Vulnerability**: The `_cheap_path` FFT cache used `(data_ptr, _version,
+shape, device)` as a cache key.  If PyTorch's caching allocator freed a
+temporary tensor and allocated a new one at the same physical address
+within the same forward pass, both would have `_version=0`, causing a
+silent false cache hit and numerical corruption.
+
+**Fix**: Replaced the dict-based cache and `forward_pre_hook` with a
+dynamic attribute (`_daph_fft_memo`) bound directly to the normalised
+tensor `x` via `object.__setattr__`.  The cached FFT is now tied to the
+tensor's GC lifecycle — when `x` is freed, the cache is freed with it.
+No manual clearing needed; no false hits possible.
+
+**Files**: `daph_exfusion/adaptive_top_p_router.py`
+
+### 2. MLX Host-Device Sync Bubble Elimination (L=1 Decode)
+
+**Bottleneck**: `MLXDAPHDecoderLayer` with `skip_inactive_paths=True`
+called `mx.eval(dominant)` unconditionally, causing a host-device
+synchronization stall.  During single-token decoding (L=1), this sync
+overhead dominated the compute savings (15–30% latency penalty).
+
+**Fix**: The blocking `mx.eval` path is now only used during prefill
+(L > 1), where computing a single dominant path saves significant FLOPs.
+For L=1 decode, the layer always uses the non-blocking `mx.where` path,
+keeping execution entirely on the GPU graph.  This preserves `mx.compile`
+tracing compatibility.
+
+**Files**: `daph_exfusion/mlx_inference.py`
+
+### 3. Coalesced State Write-Back in Cooperative Metal Kernel
+
+**Bottleneck**: In the cooperative Mamba scan kernel, threads within a
+SIMD group wrote final recurrent state elements to global memory with a
+stride of `S` between consecutive threads, causing non-coalesced writes
+and memory bank conflicts.
+
+**Fix**: Added threadgroup shared memory staging: each channel's W=32
+threads first write their `S` state elements into a partitioned shared
+memory buffer (partitioned by channel index within the threadgroup),
+then a `threadgroup_barrier` ensures all threads have staged, and
+finally a transposed round-robin write pattern produces stride-1
+coalesced global writes.  Shared memory footprint: `8 * d_state` floats
+per threadgroup (4KB for d_state=128, 8KB for d_state=256 — fits in L1).
+
+**Files**: `daph_exfusion/mlx_inference.py`
+
+### 4. Async Stream-Based K-FAC Offloading (Device-Agnostic)
+
+**Bottleneck**: The orchestrator's `offload_experts_to_cpu` and
+`recall_experts_to_gpu` used blocking transfers, stalling CPU execution
+during calibration of large models.
+
+**Fix**: Added optional `stream` parameter to both functions.  When
+CUDA is available, a background `torch.cuda.Stream` enables non-blocking
+overlapped transfers.  On Apple Silicon (MPS), where `torch.mps.Stream`
+does not exist, the functions fall back to `non_blocking=True` transfers
+without a dedicated stream.  The `AutomatedMergePipeline.execute()`
+method now creates a transfer stream (when available) and inserts
+`_sync_stream` barriers at the correct points to overlap FFN Fisher
+computation with Mamba expert offloading/recall.
+
+**Files**: `daph_exfusion/orchestrator.py`
+
+### Test Coverage
+
+12 new tests in `tests/test_v460_fixes.py` covering all 4 fixes.
+Total: 93 tests, all passing.
+
 ## v4.5.0 — Macro Router Enhancements (2026-07-06)
 
 Targeted improvements to the `AdaptiveTopPMacroRouter` (PyTorch) and

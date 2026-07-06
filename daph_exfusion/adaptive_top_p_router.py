@@ -301,16 +301,17 @@ class DAPHDecoderLayerV2(nn.Module):
 
         self.final_norm = nn.LayerNorm(hidden_size)
 
-        # Forward-scoped ephemeral cache: cleared at the start of each
-        # forward pass to prevent false cache hits from PyTorch's
-        # caching allocator recycling tensor memory addresses.
-        self._fft_cache = {}
-        self.register_forward_pre_hook(self._clear_ephemeral_cache)
-
-    @staticmethod
-    def _clear_ephemeral_cache(module, inputs):
-        """Clear ephemeral caches at the boundary of each forward pass."""
-        module._fft_cache.clear()
+        # v4.6.0: The FFT cache is now bound to the tensor object's lifecycle
+        # via a dynamic attribute (see _cheap_path).  This eliminates the
+        # need for a forward_pre_hook and the data_ptr-based cache key,
+        # which was vulnerable to within-pass address recycling: if
+        # PyTorch's allocator freed a temporary and allocated a new tensor
+        # at the same address within the same forward pass, both would
+        # have _version=0, causing a false cache hit.
+        #
+        # The old _fft_cache dict and _clear_ephemeral_cache pre-hook have
+        # been removed.  The tensor-bound attribute is automatically freed
+        # by Python's GC when the tensor goes out of scope.
 
     def compute_z_loss(self, hidden: torch.Tensor) -> torch.Tensor:
         """Auxiliary router z-loss for training regularisation.
@@ -336,25 +337,27 @@ class DAPHDecoderLayerV2(nn.Module):
         2D FFT across (sequence, hidden) dimensions, and projects the real
         component back to the hidden dimension.
 
-        The FFT result is memoised based on the input tensor's data pointer
-        and shape, so repeated calls with the same input (e.g. when the
-        residual stream hasn't changed between the cheap path and other
-        paths in the same layer) avoid recomputing the FFT.
+        The FFT result is memoised by binding it directly to the normalised
+        tensor ``x`` as a dynamic attribute (``_daph_fft_memo``).  This ties
+        the cache's lifetime to the tensor's GC lifecycle: when ``x`` is
+        freed, the cached FFT is freed with it.  This eliminates the
+        within-pass address recycling vulnerability that the previous
+        ``data_ptr``-based cache key suffered from.
         """
         if not self.use_cheap_path or self.cheap_proj is None or self.cheap_norm is None:
             return torch.zeros_like(hidden)
         x = self.cheap_norm(hidden)
-        # Memoise the FFT based on the normalised tensor's identity.
-        # The cache is cleared at each forward boundary by the pre-hook,
-        # so recycled addresses from prior steps cannot cause false hits.
-        cache_key = (x.data_ptr(), x._version, x.shape, x.device)
-        if cache_key in self._fft_cache:
-            x_fft = self._fft_cache[cache_key]
-        else:
+        # Bind the cache directly to the lifetime of the normalised tensor.
+        # If x is garbage collected, the attribute and its cached tensor
+        # are freed automatically.  This prevents false hits from recycled
+        # memory addresses within the same forward pass.
+        x_fft = getattr(x, "_daph_fft_memo", None)
+        if x_fft is None:
             # Upcast to float32 before FFT — torch.fft does not support
             # half-precision (float16/bfloat16) on many GPU and CPU platforms.
             x_fft = torch.fft.fft2(x.float(), dim=(-2, -1)).real.to(x.dtype)
-            self._fft_cache[cache_key] = x_fft
+            # Use object.__setattr__ to bypass any custom tensor __setattr__.
+            object.__setattr__(x, "_daph_fft_memo", x_fft)
         return self.cheap_proj(x_fft)
 
     @staticmethod
