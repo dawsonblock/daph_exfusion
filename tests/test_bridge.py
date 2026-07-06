@@ -60,7 +60,7 @@ def test_validate_raises_on_missing_keys():
     """A partial state dict must fail loudly under raise_on_mismatch=True."""
     bad_state = {"attention_path.attn.q_proj.weight": torch.randn(64, 32)}
     mlx_model = MLXDAPHDecoderLayer(hidden_size=64, intermediate_size=128, num_heads=4)
-    with pytest.raises(RuntimeError, match="Parameter mismatch"):
+    with pytest.raises(RuntimeError, match="Bridge Parity Violation"):
         validate_architecture_compatibility(bad_state, mlx_model, raise_on_mismatch=True)
 
 
@@ -73,4 +73,4 @@ def test_validate_warns_on_missing_keys_when_lenient():
         _warnings.simplefilter("always")
         result = validate_architecture_compatibility(bad_state, mlx_model, raise_on_mismatch=False)
     assert result is False
-    assert any("Parameter mismatch" in str(w.message) for w in caught)
+    assert any("Bridge Parity Violation" in str(w.message) for w in caught)

@@ -188,6 +188,15 @@ class DAPHDecoderLayerV2(nn.Module):
         mask, probs = self.macro_router(hidden, external_difficulty)
         # mask: (B, L, 3), probs: (B, L, 3)
 
+        # Re-normalize probabilities over selected paths so tokens that
+        # activate only a subset of paths retain full output scale.
+        # Without this, an easy token activating only the cheap path gets
+        # squashed by probs[:,:,2] (e.g. 0.6), causing exponential scale
+        # decay across decoder layers.
+        active_probs = probs * mask.to(probs.dtype)
+        prob_sum = active_probs.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        norm_probs = active_probs / prob_sum  # sums to 1.0 over active paths
+
         # Only compute paths that are actually selected
         out = torch.zeros_like(hidden)
 
@@ -197,7 +206,7 @@ class DAPHDecoderLayerV2(nn.Module):
         # misleading claims of per-token savings while maintaining correctness.
         if self.attn_path is not None and mask[:, :, 0].any():
             attn_out = self.attn_path(hidden, **attn_kwargs)
-            out += attn_out * probs[:, :, 0:1] * mask[:, :, 0:1]
+            out += attn_out * norm_probs[:, :, 0:1]
 
         if (self.ffn_path is not None or self.mamba_path is not None) and mask[:, :, 1].any():
             eff_out = torch.zeros_like(hidden)
@@ -205,11 +214,11 @@ class DAPHDecoderLayerV2(nn.Module):
                 eff_out += self.ffn_path(hidden)
             if self.mamba_path is not None:
                 eff_out += self.mamba_path(hidden)
-            out += eff_out * probs[:, :, 1:2] * mask[:, :, 1:2]
+            out += eff_out * norm_probs[:, :, 1:2]
 
         if self.use_cheap_path and mask[:, :, 2].any():
             cheap_out = self._cheap_path(hidden)
-            out += cheap_out * probs[:, :, 2:3] * mask[:, :, 2:3]
+            out += cheap_out * norm_probs[:, :, 2:3]
 
         return self.final_norm(residual + out)
 

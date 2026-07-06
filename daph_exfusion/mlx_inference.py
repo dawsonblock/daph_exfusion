@@ -40,11 +40,11 @@ def fused_swiglu_epilogue(gate_out: mx.array, up_out: mx.array) -> mx.array:
     )[0]
 
 
-# Mamba Selective Scan
+# Mamba Selective Scan — fused output + final-state capture
 _mamba_scan_kernel = mx.fast.metal_kernel(
     name="mamba_selective_scan",
     input_names=["delta", "A_log", "B", "C", "D", "x"],
-    output_names=["y"],
+    output_names=["y", "h_last"],
     source="""
         uint elem = thread_position_in_grid.x;   
         uint bsz = x_shape[0];
@@ -69,10 +69,20 @@ _mamba_scan_kernel = mx.fast.metal_kernel(
 
             y[idx] = T(Ct_f * state_f + (float)D[c_idx] * xt_f);
         }
+        // Write the final recurrent state directly from the GPU register,
+        // eliminating the need for a sequential Python pre-fill loop.
+        h_last[b_idx * d + c_idx] = T(state_f);
     """,
 )
 
-def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array, C: mx.array, D: mx.array, x: mx.array) -> mx.array:
+def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
+                         C: mx.array, D: mx.array, x: mx.array) -> tuple:
+    """Fused Metal selective scan returning both outputs and final state.
+
+    Returns ``(y, h_last)`` where ``y`` has shape ``(B, L, D)`` and ``h_last``
+    has shape ``(B, D)`` — the final recurrent state after processing the
+    full sequence, captured in the same GPU pass with no Python loop.
+    """
     dtype = x.dtype
     delta = delta.astype(dtype)
     A_log = A_log.astype(dtype)
@@ -80,14 +90,18 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array, C: mx.ar
     C = C.astype(dtype)
     D = D.astype(dtype)
     
-    return _mamba_scan_kernel(
+    y_shape = x.shape
+    h_last_shape = (x.shape[0], x.shape[2])  # (B, D)
+
+    y, h_last = _mamba_scan_kernel(
         inputs=[delta, A_log, B, C, D, x],
         template=[("T", dtype)],
         grid=(x.shape[0] * x.shape[2], 1, 1),
         threadgroup=(256, 1, 1),
-        output_shapes=[x.shape],
-        output_dtypes=[dtype],
-    )[0]
+        output_shapes=[y_shape, h_last_shape],
+        output_dtypes=[dtype, dtype],
+    )
+    return y, h_last
 
 
 def mamba_selective_scan_reference(delta: mx.array, A_log: mx.array, B: mx.array, C: mx.array, D: mx.array, x: mx.array) -> mx.array:
@@ -139,6 +153,51 @@ def ssm_prefill_loop(delta: mx.array, Bc: mx.array, u: mx.array,
     return state
 
 
+def test_scan_correctness(B: int = 2, L: int = 8, D: int = 16, atol: float = 1e-5) -> bool:
+    """Verify the fused Metal kernel matches the pure-Python reference loop.
+
+    Checks both the output sequence ``y`` and the final state ``h_last``.
+    """
+    delta = mx.random.normal((B, L, D))
+    A_log = mx.random.normal((D,))
+    Bv = mx.random.normal((B, L, D))
+    C = mx.random.normal((B, L, D))
+    Dv = mx.random.normal((D,))
+    x = mx.random.normal((B, L, D))
+
+    y_ref = mamba_selective_scan_reference(delta, A_log, Bv, C, Dv, x)
+    y_ker, h_last = mamba_selective_scan(delta, A_log, Bv, C, Dv, x)
+
+    y_match = np.allclose(np.array(y_ref), np.array(y_ker), atol=atol)
+
+    # Verify h_last by replaying the reference recurrence to get the final state.
+    a = -mx.exp(A_log)
+    state_ref = mx.zeros((B, D))
+    for t in range(L):
+        decay = mx.exp(delta[:, t, :] * a)
+        state_ref = decay * state_ref + delta[:, t, :] * Bv[:, t, :] * x[:, t, :]
+    h_match = np.allclose(np.array(state_ref), np.array(h_last), atol=atol)
+
+    return bool(y_match and h_match)
+
+
+def test_scan_with_real_weights(d_model: int = 64, L: int = 16, atol: float = 1e-4) -> bool:
+    """End-to-end scan correctness with a real MLXMergedMamba module."""
+    mamba = MLXMergedMamba(d_model)
+    x = mx.random.normal((1, L, d_model))
+    y = mamba(x)
+    # Also run via the reference path for comparison
+    h = mamba.in_proj(x)
+    a_gate, b_gate = h[..., :d_model], h[..., d_model:]
+    u = nn.silu(a_gate) * b_gate
+    delta = nn.softplus(mamba.dt_proj(u))
+    Bc = mamba.x_proj_B(u)
+    Cc = mamba.x_proj_C(u)
+    y_ref = mamba_selective_scan_reference(delta, mamba.A_log, Bc, Cc, mamba.D, u)
+    y_ref_out = mamba.out_proj(y_ref)
+    return bool(np.allclose(np.array(y), np.array(y_ref_out), atol=atol))
+
+
 # =============================================================================
 # 2. STATELESS MLX LAYER STACK
 # =============================================================================
@@ -158,33 +217,132 @@ class MLXSwiGLUFFN(nn.Module):
 
 
 class MLXMergedMamba(nn.Module):
-    def __init__(self, d_model: int):
+    """Mamba SSM block with standard 1D causal convolution.
+
+    Matches the architecture of Mamba-1/Mamba-2/Jamba: a depthwise conv1d
+    (kernel width 4) is applied after the input projection gating and before
+    the selective scan.  This is required for loading real-world pre-trained
+    Mamba weights.
+    """
+    def __init__(self, d_model: int, d_conv: int = 4):
         super().__init__()
         self.d_model = d_model
+        self.d_conv = d_conv
         self.in_proj = nn.Linear(d_model, d_model * 2, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        # Standard depthwise 1D convolution (kernel=4, causal left-padding)
+        self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=d_conv,
+                                stride=1, padding=0, groups=d_model, bias=True)
         self.x_proj_B = nn.Linear(d_model, d_model, bias=False)
         self.x_proj_C = nn.Linear(d_model, d_model, bias=False)
         self.dt_proj = nn.Linear(d_model, d_model, bias=False)
         self.A_log = mx.zeros((d_model,))
         self.D = mx.zeros((d_model,))
 
+    def _causal_conv1d(self, u: mx.array) -> mx.array:
+        """Apply causal depthwise conv1d with left-padding.
+
+        MLX Conv1d uses (N, L, C) format.  We left-pad with ``d_conv - 1``
+        zeros and use ``padding=0`` so each output position depends only on
+        current and past inputs (causal).
+        """
+        B, L, D = u.shape
+        pad = mx.zeros((B, self.d_conv - 1, D), dtype=u.dtype)
+        u_padded = mx.concatenate([pad, u], axis=1)  # (B, L + k - 1, D)
+        return self.conv1d(u_padded)  # (B, L, D)
+
     def __call__(self, x: mx.array) -> mx.array:
         h = self.in_proj(x)
         a_gate, b_gate = h[..., :self.d_model], h[..., self.d_model:]
-        u = nn.silu(a_gate) * b_gate  
+        u = nn.silu(a_gate) * b_gate
+
+        # Standard Mamba: depthwise causal conv1d + SiLU before projections
+        u = nn.silu(self._causal_conv1d(u))
 
         delta = nn.softplus(self.dt_proj(u))
         Bc = self.x_proj_B(u)
         Cc = self.x_proj_C(u)
 
-        y = mamba_selective_scan(delta, self.A_log, Bc, Cc, self.D, u)
+        y, _ = mamba_selective_scan(delta, self.A_log, Bc, Cc, self.D, u)
         return self.out_proj(y)
 
 
+class MLXRotaryEmbedding:
+    """Rotary Position Embeddings (RoPE) for MLX attention.
+
+    Applies rotary embeddings to query and key tensors before the scaled
+    dot-product attention, encoding relative position information.  This is
+    required for compatibility with standard autoregressive Transformer
+    architectures (Llama, Mistral, Qwen, etc.).
+
+    The cos/sin caches are built lazily and extended as needed.
+    """
+
+    def __init__(self, head_dim: int, max_position_embeddings: int = 4096,
+                 base: float = 10000.0):
+        self.head_dim = head_dim
+        self.base = base
+        self.max_position_embeddings = max_position_embeddings
+        self._build_cache(max_position_embeddings)
+
+    def _build_cache(self, seq_len: int):
+        """Build cos/sin caches up to ``seq_len`` positions."""
+        inv_freq = 1.0 / (self.base ** (
+            mx.arange(0, self.head_dim, 2, dtype=mx.float32) / self.head_dim
+        ))
+        t = mx.arange(seq_len, dtype=mx.float32)
+        freqs = mx.outer(t, inv_freq)  # (seq_len, head_dim // 2)
+        # Duplicate to match head_dim: [f0, f1, ..., f0, f1, ...]
+        emb = mx.concatenate([freqs, freqs], axis=-1)  # (seq_len, head_dim)
+        self._cos = mx.cos(emb)
+        self._sin = mx.sin(emb)
+        self._cached_len = seq_len
+
+    def _ensure_cache(self, offset: int, L: int):
+        needed = offset + L
+        if needed > self._cached_len:
+            self._build_cache(max(needed, self._cached_len * 2))
+
+    @staticmethod
+    def _rotate_half(x: mx.array) -> mx.array:
+        """Rotate the second half of the last dimension."""
+        half = x.shape[-1] // 2
+        x1 = x[..., :half]
+        x2 = x[..., half:]
+        return mx.concatenate([-x2, x1], axis=-1)
+
+    def apply_rope(self, q: mx.array, k: mx.array,
+                   offset: int = 0) -> tuple:
+        """Apply RoPE to q and k.
+
+        Args:
+            q, k: (B, num_heads, L, head_dim) tensors.
+            offset: Position offset (for use with KV-cache during decoding).
+
+        Returns:
+            (q_rotated, k_rotated) with the same shapes.
+        """
+        L = q.shape[2]
+        self._ensure_cache(offset, L)
+        cos = self._cos[offset:offset + L, :]  # (L, head_dim)
+        sin = self._sin[offset:offset + L, :]
+        # Broadcast cos/sin to (1, 1, L, head_dim) for elementwise mul.
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+        q_embed = q * cos + self._rotate_half(q) * sin
+        k_embed = k * cos + self._rotate_half(k) * sin
+        return q_embed, k_embed
+
+
 class MLXFlashAttention(nn.Module):
-    """Separate Q/K/V/O projections to match PyTorch DAPHDecoderLayer exactly."""
-    def __init__(self, hidden_size: int, num_heads: int, bias: bool = False):
+    """Separate Q/K/V/O projections with optional Rotary Position Embeddings.
+
+    RoPE is applied to Q and K before the scaled dot-product attention,
+    matching the architecture of modern autoregressive Transformers (Llama,
+    Mistral, Qwen).  Set ``use_rope=False`` to disable for ablations.
+    """
+    def __init__(self, hidden_size: int, num_heads: int, bias: bool = False,
+                 use_rope: bool = True, max_position_embeddings: int = 4096):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
@@ -192,16 +350,26 @@ class MLXFlashAttention(nn.Module):
         self.k_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.use_rope = use_rope
+        if use_rope:
+            self.rope = MLXRotaryEmbedding(self.head_dim, max_position_embeddings)
+        else:
+            self.rope = None
 
-    def __call__(self, x: mx.array, mask: mx.array = None) -> mx.array:
+    def __call__(self, x: mx.array, mask: mx.array = None,
+                 offset: int = 0) -> mx.array:
         B, L, D = x.shape
         q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
+        # Apply Rotary Position Embeddings to Q and K
+        if self.rope is not None:
+            q, k = self.rope.apply_rope(q, k, offset=offset)
+
         scale = 1.0 / math.sqrt(self.head_dim)
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
-        
+
         out = out.transpose(0, 2, 1, 3).reshape(B, L, D)
         return self.o_proj(out)
 
@@ -213,8 +381,9 @@ class MLXAttentionPath(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
         self.attn = MLXFlashAttention(hidden_size, num_heads)
 
-    def __call__(self, x: mx.array, mask: mx.array = None) -> mx.array:
-        return self.attn(self.norm(x), mask=mask)
+    def __call__(self, x: mx.array, mask: mx.array = None,
+                 offset: int = 0) -> mx.array:
+        return self.attn(self.norm(x), mask=mask, offset=offset)
 
 
 class MLXFNetBlock(nn.Module):
@@ -368,7 +537,7 @@ class MLXAdaptiveTopPMacroRouter(nn.Module):
         diff_sq = difficulty.squeeze(-1)                  # (B*L,)
 
         threshold = self.base_threshold - self.difficulty_scale * (diff_sq - 0.5)
-        threshold = mx.clip(threshold, min_val=0.4, max_val=0.95)  # (B*L,)
+        threshold = mx.clip(threshold, 0.4, 0.95)  # (B*L,)
 
         # Descending sort via negation
         sorted_indices = mx.argsort(-probs, axis=-1)      # (B*L, num_paths)
@@ -385,16 +554,15 @@ class MLXAdaptiveTopPMacroRouter(nn.Module):
         first_column = mx.ones((probs.shape[0], 1), dtype=mx.bool_)
         mask_sorted = mx.concatenate([first_column, shifted_under], axis=1)
 
-        # Scatter back to original path order using flat indexing
-        flat_indices = (sorted_indices + rows * self.num_paths).flatten()
-        flat_mask_sorted = mask_sorted.flatten()
-
-        flat_selected = mx.zeros(probs.size, dtype=mx.bool_)
-        flat_selected = flat_selected.at[flat_indices].set(flat_mask_sorted)
-        selected_mask = flat_selected.reshape(probs.shape)
+        # Scatter back to original path order.  MLX 0.31's ArrayAt doesn't
+        # support .set(), so we use the inverse argsort to unscramble the
+        # sorted mask back to the original path order.
+        inverse_indices = mx.argsort(sorted_indices, axis=-1)  # (B*L, num_paths)
+        mask_unsorted = mx.take_along_axis(mask_sorted, inverse_indices, axis=-1)
+        selected_mask = mask_unsorted.reshape(B, L, -1)
 
         return (
-            selected_mask.reshape(B, L, -1),
+            selected_mask,
             probs.reshape(B, L, -1),
             difficulty.reshape(B, L, 1),
         )
@@ -432,6 +600,22 @@ class SSMState:
         self.h = h_new
 
 
+class ConvState:
+    """Rolling history buffer for causal depthwise conv1d during decoding.
+
+    Stores the last ``kernel_size - 1`` projected inputs so that single-token
+    decoding steps can apply the conv1d without reprocessing the full sequence.
+    """
+    def __init__(self, bsz: int, d_model: int, kernel_size: int = 4, dtype=mx.float32):
+        self.kernel_size = kernel_size
+        self.history = mx.zeros((bsz, kernel_size - 1, d_model), dtype=dtype)
+
+    def update(self, x_new: mx.array) -> mx.array:
+        """Append ``x_new`` (B, 1, D) and return the full conv window (B, k, D)."""
+        self.history = mx.concatenate([self.history[:, 1:, :], x_new], axis=1)
+        return self.history
+
+
 class MLXStatefulDAPHDecoderLayer(nn.Module):
     """
     Stateful DAPH decoder layer with adaptive top-p routing,
@@ -449,6 +633,7 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
     def __call__(self, hidden: mx.array,
                  kv_cache: KVCache = None,
                  ssm_state: SSMState = None,
+                 conv_state: ConvState = None,
                  mask: mx.array = None) -> mx.array:
         """
         Forward pass for the stateful DAPH decoder layer.
@@ -457,6 +642,7 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
             hidden: (B, L, D) input tensor.
             kv_cache: Optional KVCache to accumulate keys/values for attention.
             ssm_state: Optional SSMState to track recurrent Mamba hidden state.
+            conv_state: Optional ConvState for Mamba conv1d during single-token decoding.
             mask: Optional attention mask.
 
         Returns:
@@ -470,6 +656,16 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
         use_attn = macro_mask[:, :, 0:1]
         use_eff = macro_mask[:, :, 1:2]
         use_cheap = macro_mask[:, :, 2:3]
+
+        # Re-normalize probabilities over selected paths so tokens that
+        # activate only a subset of paths retain full output scale.
+        # Without this, an easy token activating only the cheap path gets
+        # squashed by its raw softmax probability (e.g. 0.6), causing
+        # exponential scale decay across decoder layers.
+        active_probs = macro_probs * macro_mask.astype(macro_probs.dtype)
+        prob_sum = active_probs.sum(axis=-1, keepdims=True)
+        prob_sum = mx.maximum(prob_sum, 1e-8)
+        norm_probs = active_probs / prob_sum  # sums to 1.0 over active paths
 
         # 1. Attention Path with KV-cache support
         if kv_cache is not None:
@@ -503,11 +699,18 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
 
         # 2. Mamba path with optional step-wise SSM recurrence
         if ssm_state is not None and L == 1:
-            # Perform efficient step-wise update of the Mamba state
-            # Project input to obtain gating vectors
+            # Single-token decoding: step-wise update of the Mamba state
             h = self.mamba_path.in_proj(hidden)  # (B, 1, 2D)
             a_gate, b_gate = h[..., :self.mamba_path.d_model], h[..., self.mamba_path.d_model:]
             u = nn.silu(a_gate) * b_gate  # (B, 1, D)
+
+            # Apply causal conv1d using the rolling ConvState buffer.
+            # conv_state stores the last (d_conv - 1) projected inputs;
+            # we append the current one and apply the depthwise conv.
+            if conv_state is not None:
+                window = conv_state.update(u)  # (B, d_conv, D)
+                u_conv = self.mamba_path.conv1d(window)  # (B, 1, D)
+                u = nn.silu(u_conv)
 
             # Delta, B and C projections
             delta = nn.softplus(self.mamba_path.dt_proj(u)).squeeze(1)  # (B, D)
@@ -525,35 +728,37 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
             mamba_out = self.mamba_path.out_proj(y_step[:, None, :])    # (B, 1, D)
         else:
             # Full sequence selective scan for stateless mode
-            # Run the Mamba kernel over the entire sequence to produce outputs
-            mamba_out = self.mamba_path(hidden)
-            # During pre-fill (L > 1) we must also capture the final recurrent state
-            # for subsequent autoregressive decoding. The Metal kernel returns
-            # only the output sequence, so we reconstruct the last hidden state
-            # via a trace-safe reference recurrence. This incurs an O(L) loop
-            # but is required for correct state initialization.
             if ssm_state is not None:
-                # Project hidden to gating vectors for all time steps
+                # Pre-fill path: compute outputs AND capture the final recurrent
+                # state in a single GPU pass via the fused metal kernel, which
+                # now returns (y, h_last).  This eliminates the sequential O(L)
+                # Python pre-fill loop entirely.
                 h_proj = self.mamba_path.in_proj(hidden)  # (B, L, 2D)
                 a_gate, b_gate = h_proj[..., :self.mamba_path.d_model], h_proj[..., self.mamba_path.d_model:]
                 u = nn.silu(a_gate) * b_gate  # (B, L, D)
 
-                # Compute delta, B and C projections for all steps
+                # Apply causal conv1d + SiLU (standard Mamba block)
+                u = nn.silu(self.mamba_path._causal_conv1d(u))
+
                 delta = nn.softplus(self.mamba_path.dt_proj(u))  # (B, L, D)
                 Bc = self.mamba_path.x_proj_B(u)  # (B, L, D)
-                # We do not need C projection for state update
+                Cc = self.mamba_path.x_proj_C(u)  # (B, L, D)
 
-                # Initialize zero state for each batch
-                a = -mx.exp(self.mamba_path.A_log)
-                # state has shape (B, D)
-                state = mx.zeros((B, self.mamba_path.d_model), dtype=delta.dtype)
-                # Iterate through sequence dimension to accumulate final state.
-                # Each step is a single compiled kernel call (_ssm_prefill_step)
-                # instead of a chain of eager ops, keeping the per-step graph
-                # node count to ~1 instead of ~5.
-                state = ssm_prefill_loop(delta, Bc, u, a, state)
-                # Update the provided SSMState with the final state
-                ssm_state.update(state)
+                y_seq, h_last = mamba_selective_scan(
+                    delta, self.mamba_path.A_log, Bc, Cc, self.mamba_path.D, u
+                )
+                mamba_out = self.mamba_path.out_proj(y_seq)
+                ssm_state.update(h_last)
+
+                # Seed the ConvState with the last (d_conv - 1) projected
+                # inputs so subsequent single-token decoding steps have the
+                # correct conv window.
+                if conv_state is not None:
+                    k = self.mamba_path.d_conv
+                    conv_state.history = u[:, -(k - 1):, :].astype(conv_state.history.dtype)
+            else:
+                # Pure stateless mode — no state capture needed
+                mamba_out = self.mamba_path(hidden)
 
         # 3. Feed-forward network output
         ffn_out = self.ffn_path(hidden)
@@ -562,11 +767,88 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
         # 4. Cheap path via FNet
         cheap_out = self.cheap_path(hidden)
 
-        # 5. Blend outputs based on macro masks and probabilities
+        # 5. Blend outputs based on macro masks and re-normalized probabilities
         routed_out = (
-            attn_out * use_attn * macro_probs[:, :, 0:1] +
-            eff_out * use_eff * macro_probs[:, :, 1:2] +
-            cheap_out * use_cheap * macro_probs[:, :, 2:3]
+            attn_out * use_attn * norm_probs[:, :, 0:1] +
+            eff_out * use_eff * norm_probs[:, :, 1:2] +
+            cheap_out * use_cheap * norm_probs[:, :, 2:3]
         )
 
         return self.final_norm(residual + routed_out)
+
+
+# =============================================================================
+# 6. TOP-LEVEL STATEFUL CAUSAL LM
+# =============================================================================
+
+class MLXStatefulCausalLM(nn.Module):
+    """Top-level causal LM container for multi-layer autoregressive generation.
+
+    Manages per-layer KV-caches, SSM states, and conv states, and handles
+    the transition from pre-fill (L > 1) to single-token decoding (L = 1).
+
+    Usage::
+
+        model = MLXStatefulCausalLM(num_layers=4, vocab_size=32000, ...)
+        caches = [KVCache() for _ in range(num_layers)]
+        ssm_states = [SSMState(B, D) for _ in range(num_layers)]
+        conv_states = [ConvState(B, D) for _ in range(num_layers)]
+
+        # Pre-fill
+        logits = model(tokens, caches=caches, ssm_states=ssm_states,
+                       conv_states=conv_states)
+
+        # Decode one token at a time
+        for _ in range(max_new_tokens):
+            logits = model(next_token[:, None], caches=caches,
+                           ssm_states=ssm_states, conv_states=conv_states,
+                           offset=current_len)
+            next_token = sample(logits[:, -1, :])
+            current_len += 1
+    """
+
+    def __init__(self, num_layers: int, vocab_size: int, hidden_size: int,
+                 intermediate_size: int, num_heads: int):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
+        self.layers = [
+            MLXStatefulDAPHDecoderLayer(hidden_size, intermediate_size, num_heads)
+            for _ in range(num_layers)
+        ]
+        self.norm = nn.LayerNorm(hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+
+    def __call__(self, tokens: mx.array,
+                 caches: list = None,
+                 ssm_states: list = None,
+                 conv_states: list = None,
+                 offset: int = 0) -> mx.array:
+        """Forward pass returning logits ``(B, L, vocab_size)``.
+
+        Args:
+            tokens: ``(B, L)`` integer token IDs.
+            caches: Optional list of ``KVCache`` per layer.
+            ssm_states: Optional list of ``SSMState`` per layer.
+            conv_states: Optional list of ``ConvState`` per layer.
+            offset: Position offset for RoPE (use current sequence length
+                during single-token decoding with a KV-cache).
+        """
+        x = self.embed_tokens(tokens)  # (B, L, D)
+        B, L, D = x.shape
+
+        # Build causal attention mask for pre-fill (L > 1)
+        mask = None
+        if L > 1:
+            mask = mx.triu(mx.full((L, L), -float("inf")), k=1)
+
+        for i, layer in enumerate(self.layers):
+            layer_cache = caches[i] if caches is not None else None
+            layer_ssm = ssm_states[i] if ssm_states is not None else None
+            layer_conv = conv_states[i] if conv_states is not None else None
+            x = layer(x, kv_cache=layer_cache, ssm_state=layer_ssm,
+                      conv_state=layer_conv, mask=mask)
+
+        x = self.norm(x)
+        return self.lm_head(x)

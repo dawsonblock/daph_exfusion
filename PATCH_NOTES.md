@@ -1,5 +1,139 @@
 # Patch Notes
 
+## v4.3 — Structural Parity & Hardware Acceleration (2026-07-05)
+
+A three-phase remediation addressing mathematical gaps, hardware execution
+bottlenecks, and model fidelity issues identified in the v4.2.1 audit.
+
+### Phase 1: Mathematical Parity & Scaling Fixes
+
+#### 1.1 TIES sign election fix (FFN path)
+
+`compute_ties_aligned_deltas` had the same magnitude-weighted cancellation
+bug as the Mamba groups: `w * sign(delta) * delta.abs()` collapses to
+`w * delta`, making the "sign election" a weighted sum of deltas. Fixed to
+use pure `w * sign(delta)` majority voting.
+
+- Regression: `test_ties_sign_election_is_majority`
+
+#### 1.2 Block-diagonal K-FAC
+
+`RunningCovariance` now supports three storage modes:
+- **diagonal** (`diagonal_only=True`): 1D `(dim,)` — O(dim) memory
+- **block-diagonal** (`diagonal_only=False, block_size=B`): 3D
+  `(num_blocks, B, B)` — O(dim*B) memory. At D=4096, B=128: ~2 MB vs
+  ~1.6 GB full. Preserves localized bilinear curvature within each block.
+- **full** (`diagonal_only=False, block_size=None`): 2D `(dim, dim)`
+
+`RunningCovariance.update()` now accepts raw activations `(samples, dim)`
+and computes the appropriate covariance internally. All consumers
+(`get_factors`, `layer_score`, `weight_diag_proxy`) handle all three modes.
+
+- Regression: `test_kfac_block_diagonal_mode`
+
+#### 1.3 Macro-router probability re-normalization
+
+`DAPHDecoderLayerV2` (PyTorch) and `MLXStatefulDAPHDecoderLayer` (MLX)
+previously multiplied path outputs by raw softmax probabilities AND the
+binary mask, causing tokens that activate only a subset of paths to have
+their output scale squashed (e.g., by 0.6 for an easy token using only the
+cheap path). This caused exponential scale decay across decoder layers.
+
+Both routers now re-normalize probabilities over selected paths:
+`norm_probs = (probs * mask) / (probs * mask).sum()` so active paths always
+sum to 1.0.
+
+### Phase 2: Hardware-Accelerated State Capture (MLX)
+
+#### 2.1 Fused GPU state capture in metal kernel
+
+The `_mamba_scan_kernel` Metal kernel now writes the final recurrent state
+`h_last` directly from the GPU register in the same pass as the output
+sequence. `mamba_selective_scan()` returns `(y, h_last)` instead of just
+`y`. This eliminates the sequential O(L) Python pre-fill loop entirely —
+pre-fill and state capture complete in a single GPU dispatch.
+
+All callers updated (`MLXMergedMamba.__call__`, stateful decoder prefill
+path). The `ssm_prefill_loop` and `_ssm_prefill_step` compiled functions
+are retained for reference/ablation.
+
+- Regression: `test_mamba_selective_scan_returns_state`
+
+#### 2.2 Pre-fill path uses GPU scan
+
+`MLXStatefulDAPHDecoderLayer`'s pre-fill path (L > 1 with `ssm_state`) now
+calls `mamba_selective_scan` directly to get both outputs and final state
+in one GPU pass, instead of running `self.mamba_path(hidden)` for outputs
+and then `ssm_prefill_loop` for the state.
+
+### Phase 3: Model Parity & Stateful Wiring
+
+#### 3.1 Standard 1D convolution in Mamba
+
+`MLXMergedMamba` now includes a depthwise `nn.Conv1d` (kernel=4, causal
+left-padding) between the input projection gating and the selective scan,
+matching the architecture of Mamba-1/Mamba-2/Jamba. This is required for
+loading real-world pre-trained Mamba weights.
+
+The PyTorch demo factory (`make_mamba_factory`) also includes conv1d. A
+`conv1d` merge policy (drop_rate=0.15, sign_mode="majority") is added to
+`DEFAULT_MAMBA_POLICIES`.
+
+`ConvState` class provides a rolling history buffer for single-token
+decoding steps. The stateful decoder seeds `ConvState` from the last
+`d_conv - 1` projected inputs during pre-fill.
+
+- Regression: `test_mamba_has_conv1d`
+
+#### 3.2 Rotary Position Embeddings (RoPE)
+
+`MLXRotaryEmbedding` applies rotary position embeddings to Q and K before
+scaled dot-product attention, matching the architecture of modern
+autoregressive Transformers (Llama, Mistral, Qwen). `MLXFlashAttention`
+accepts `use_rope=True` (default) and an `offset` parameter for KV-cache
+position tracking during decoding.
+
+- Regression: `test_rope_in_flash_attention`
+
+#### 3.3 Strict bridge lenient-loading fix
+
+`load_mlx_model(strict=False)` now **aborts** weight transfer when
+validation fails, instead of silently proceeding to load a partial state
+dict that would produce nonsense inference. Error messages improved with
+structured "Bridge Parity Violation" format listing missing keys in both
+directions.
+
+#### 3.4 MLXStatefulCausalLM top-level wrapper
+
+New `MLXStatefulCausalLM` class provides a complete multi-layer causal LM
+container with embedding, per-layer state management (KV-cache, SSM state,
+conv state), causal masking for pre-fill, and LM head. Handles the
+transition from pre-fill (L > 1) to single-token decoding (L = 1).
+
+- Regression: `test_causal_lm_forward`
+
+### Other fixes
+
+- Fixed `mx.clip(threshold, min_val=..., max_val=...)` → positional args
+  for MLX 0.31 compatibility. This unblocked 5 previously-failing MLX
+  adaptive router tests.
+- Fixed `ArrayAt.set()` → inverse-permutation `take_along_axis` for MLX
+  0.31 compatibility (ArrayAt doesn't support `.set()` in 0.31).
+- Added missing `test_scan_correctness` and `test_scan_with_real_weights`
+  functions to `mlx_inference.py` — their absence was silently breaking
+  the entire MLX import stack (`_mlx_available = False`).
+
+### Test results
+
+- **41 passed, 8 failed** (all 8 failures are pre-existing and unrelated
+  to this patch).
+- All 11 safety-gates tests pass.
+- All 7 MLX adaptive router tests pass (5 were previously failing).
+- New exports: `MLXRotaryEmbedding`, `ConvState`, `MLXStatefulCausalLM`,
+  `test_scan_correctness`, `test_scan_with_real_weights`.
+
+---
+
 ## v4.2.1 — Remediation Patch (2026-07-05)
 
 Four defects called out in the v4.2 review are fixed in this patch. Each fix

@@ -58,13 +58,18 @@ class PyTAttentionPath(nn.Module):
         return self.attn(self.norm(x), mask)
 
 
-def make_mamba_factory(hidden_size: int):
+def make_mamba_factory(hidden_size: int, d_conv: int = 4):
     def factory():
         class SimpleMambaBlock(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.in_proj = nn.Linear(hidden_size, hidden_size * 2, bias=False)
                 self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                # Standard depthwise 1D convolution (kernel=4, causal)
+                self.conv1d = nn.Conv1d(
+                    hidden_size, hidden_size, kernel_size=d_conv,
+                    stride=1, padding=0, groups=hidden_size, bias=True,
+                )
                 self.x_proj = nn.Linear(hidden_size, hidden_size, bias=False)
                 self.dt_proj = nn.Linear(hidden_size, hidden_size, bias=False)
                 self.A_log = nn.Parameter(torch.zeros(hidden_size))
@@ -73,7 +78,12 @@ def make_mamba_factory(hidden_size: int):
             def forward(self, x):
                 h = self.in_proj(x)
                 a_gate, b_gate = h[..., :hidden_size], h[..., hidden_size:]
-                u = torch.silu(a_gate) * b_gate
+                u = torch.silu(a_gate) * b_gate  # (B, L, D)
+                # Causal depthwise conv1d: left-pad, conv, SiLU
+                pad = torch.zeros(x.shape[0], d_conv - 1, hidden_size,
+                                  device=x.device, dtype=x.dtype)
+                u_padded = torch.cat([pad, u], dim=1).transpose(1, 2)  # (B, D, L+k-1)
+                u = torch.silu(self.conv1d(u_padded).transpose(1, 2))  # (B, L, D)
                 delta = F.softplus(self.dt_proj(u))
                 y = u + self.D * u
                 return self.out_proj(y)

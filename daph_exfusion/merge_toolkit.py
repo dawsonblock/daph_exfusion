@@ -87,7 +87,7 @@ class SwiGLUFFN(nn.Module):
 
 def _is_ssm_core_param(name: str) -> bool:
     """Identify Mamba SSM core parameters that need special protection."""
-    ssm_patterns = ("A_log", "A", "D", "dt_proj", "delta_proj", "x_proj", "B_proj", "C_proj")
+    ssm_patterns = ("A_log", "A", "D", "dt_proj", "delta_proj", "x_proj", "B_proj", "C_proj", "conv1d")
     return any(p in name for p in ssm_patterns)
 
 
@@ -141,32 +141,75 @@ class KFACConfig:
     max_samples_per_batch: Optional[int] = 4096
     track_bias: bool = False
     attention_only_projections: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj")
-    # Diagonal-only Kronecker factors.  When True (default), each RunningCovariance
-    # stores only the diagonal of E[a a^T] / E[g g^T] — a 1D tensor of length dim
-    # instead of a (dim, dim) matrix.  At d_model=4096 this cuts per-layer-per-expert
-    # VRAM from ~1.6 GB to a few MB.  Cross-dim covariances are lost, but the
-    # diagonal proxy is what most K-FAC practitioners use for linear layers anyway.
-    # Set to False to opt back into full covariance for research/ablations.
+    # Kronecker factor storage mode:
+    #   diagonal_only=True  — store E[a_i^2] as a 1D vector (O(dim) memory).
+    #   diagonal_only=False, block_size=None — full E[a a^T] (O(dim^2) memory).
+    #   diagonal_only=False, block_size=B — block-diagonal E[a a^T] with B-sized
+    #     blocks (O(dim * B) memory).  At D=4096, B=128: ~2 MB vs ~1.6 GB full.
+    #     Preserves localized bilinear curvature within each block.
     diagonal_only: bool = True
+    block_size: Optional[int] = 128
 
 
 class RunningCovariance:
+    """Running EMA of a covariance estimate, supporting three storage modes.
+
+    Accepts raw activations ``x`` of shape ``(samples, dim)`` and computes the
+    appropriate covariance representation internally:
+
+    - **diagonal** (``diagonal_only=True``): stores ``(dim,)`` — E[a_i^2].
+    - **block-diagonal** (``diagonal_only=False, block_size=B``): stores
+      ``(num_blocks, B, B)`` — block-wise E[a a^T].  The last block is padded
+      if ``dim`` is not divisible by ``B``.
+    - **full** (``diagonal_only=False, block_size=None``): stores ``(dim, dim)``.
+    """
+
     def __init__(self, dim: int, decay: float = 0.95, *,
-                 diagonal_only: bool = True, device=None, dtype=torch.float32):
+                 diagonal_only: bool = True, block_size: Optional[int] = 128,
+                 device=None, dtype=torch.float32):
         self.decay = decay
         self.diagonal_only = diagonal_only
-        shape = (dim,) if diagonal_only else (dim, dim)
-        self.value = torch.zeros(shape, device=device, dtype=dtype)
+        self.block_size = block_size
+        self.dim = dim
+
+        if diagonal_only:
+            self.mode = "diagonal"
+            self.value = torch.zeros(dim, device=device, dtype=dtype)
+        elif block_size is not None and block_size < dim:
+            self.mode = "block"
+            self.num_blocks = (dim + block_size - 1) // block_size
+            self.last_block_size = dim - (self.num_blocks - 1) * block_size
+            # Store blocks in a single padded tensor for uniform EMA updates.
+            # The last block may be smaller; we pad it to block_size and track
+            # the real size so scoring/proxy methods can ignore padding.
+            self.value = torch.zeros(self.num_blocks, block_size, block_size,
+                                     device=device, dtype=dtype)
+        else:
+            self.mode = "full"
+            self.value = torch.zeros(dim, dim, device=device, dtype=dtype)
         self.initialized = False
 
     @torch.no_grad()
-    def update(self, cov: torch.Tensor):
-        cov = cov.detach()
-        if self.diagonal_only:
-            # Accept either a full (dim, dim) covariance or a precomputed (dim,)
-            # diagonal.  Storing only the diagonal keeps resident VRAM at O(dim).
-            if cov.dim() == 2:
-                cov = torch.diagonal(cov, dim1=0, dim2=1)
+    def update(self, x: torch.Tensor):
+        """Accept raw activations ``(samples, dim)`` and update the EMA."""
+        x = x.detach().float()
+        samples = max(x.shape[0], 1)
+
+        if self.mode == "diagonal":
+            cov = (x * x).sum(0) / samples
+        elif self.mode == "block":
+            bs = self.block_size
+            nb = self.num_blocks
+            # Reshape into (samples, num_blocks, block_size), zero-padding the
+            # last block's unused columns so all blocks have uniform width.
+            padded = torch.zeros(x.shape[0], nb * bs, device=x.device, dtype=x.dtype)
+            padded[:, :self.dim] = x
+            x_blocks = padded.view(samples, nb, bs).permute(1, 0, 2)  # (nb, S, B)
+            # cov per block: (nb, B, B) = x_blocks^T @ x_blocks
+            cov = torch.bmm(x_blocks.transpose(1, 2), x_blocks) / samples
+        else:  # full
+            cov = (x.t() @ x) / samples
+
         if not self.initialized:
             self.value.copy_(cov)
             self.initialized = True
@@ -175,6 +218,19 @@ class RunningCovariance:
 
     def get(self) -> torch.Tensor:
         return self.value
+
+    def diagonal(self) -> torch.Tensor:
+        """Return the full diagonal as a 1D ``(dim,)`` tensor in any mode."""
+        if self.mode == "diagonal":
+            return self.value
+        elif self.mode == "block":
+            bs = self.block_size
+            diags = torch.diagonal(self.value, dim1=1, dim2=2)  # (num_blocks, bs)
+            # Flatten and trim padding from the last block.
+            full = diags.reshape(-1)[:self.dim]
+            return full
+        else:
+            return torch.diagonal(self.value, dim1=0, dim2=1)
 
 
 class KFACFisherTracker:
@@ -218,11 +274,13 @@ class KFACFisherTracker:
             self.a_factors[name] = RunningCovariance(
                 in_dim, decay=self.config.ema_decay,
                 diagonal_only=self.config.diagonal_only,
+                block_size=self.config.block_size,
                 device=module.weight.device, dtype=torch.float32,
             )
             self.g_factors[name] = RunningCovariance(
                 out_dim, decay=self.config.ema_decay,
                 diagonal_only=self.config.diagonal_only,
+                block_size=self.config.block_size,
                 device=module.weight.device, dtype=torch.float32,
             )
 
@@ -246,23 +304,16 @@ class KFACFisherTracker:
             if self.config.track_bias and module.bias is not None:
                 ones = torch.ones(x.size(0), 1, device=x.device, dtype=x.dtype)
                 x = torch.cat([x, ones], dim=-1)
-            if self.config.diagonal_only:
-                # E[a_i^2] directly — O(dim) storage, no (dim, dim) transient.
-                cov_a = (x * x).sum(0) / max(x.shape[0], 1)
-            else:
-                cov_a = (x.t() @ x) / max(x.shape[0], 1)
-            self.a_factors[name].update(cov_a)
+            # Pass raw activations; RunningCovariance.update computes the
+            # appropriate covariance (diagonal / block-diagonal / full) internally.
+            self.a_factors[name].update(x)
         return hook
 
     def _make_backward_hook(self, name: str):
         def hook(module: nn.Module, grad_input, grad_output):
             g = grad_output[0].detach()
             g = self._flatten_samples(g).float()
-            if self.config.diagonal_only:
-                cov_g = (g * g).sum(0) / max(g.shape[0], 1)
-            else:
-                cov_g = (g.t() @ g) / max(g.shape[0], 1)
-            self.g_factors[name].update(cov_g)
+            self.g_factors[name].update(g)
         return hook
 
     @torch.no_grad()
@@ -274,6 +325,12 @@ class KFACFisherTracker:
             # Diagonal-only mode: damping is added elementwise.
             A = A + d
             G = G + d
+        elif A.dim() == 3:
+            # Block-diagonal mode: add damping to each block's diagonal.
+            nb, bs, _ = A.shape
+            eye = torch.eye(bs, device=A.device, dtype=A.dtype).unsqueeze(0)  # (1, B, B)
+            A = A + d * eye
+            G = G + d * eye
         else:
             A = A + d * torch.eye(A.size(0), device=A.device, dtype=A.dtype)
             G = G + d * torch.eye(G.size(0), device=G.device, dtype=G.dtype)
@@ -282,21 +339,32 @@ class KFACFisherTracker:
     @torch.no_grad()
     def layer_score(self, layer_name: str) -> float:
         A, G = self.get_factors(layer_name)
-        diag_mode = A.dim() == 1
+        ndim = A.dim()
+
+        def _trace(t):
+            if ndim == 1:
+                return t.sum()
+            elif ndim == 3:
+                # Sum of traces of all blocks (ignoring padding in last block).
+                diags = torch.diagonal(t, dim1=1, dim2=2)  # (num_blocks, bs)
+                return diags.sum()
+            else:
+                return torch.trace(t)
 
         if self.config.score_mode == "trace":
-            score = (A.sum() if diag_mode else torch.trace(A)) * \
-                    (G.sum() if diag_mode else torch.trace(G))
+            score = _trace(A) * _trace(G)
         elif self.config.score_mode == "log_trace":
-            score = (torch.log1p(A.sum() if diag_mode else torch.trace(A)) *
-                     torch.log1p(G.sum() if diag_mode else torch.trace(G)))
+            score = torch.log1p(_trace(A)) * torch.log1p(_trace(G))
         elif self.config.score_mode == "fro":
-            score = (torch.norm(A, p="fro") * torch.norm(G, p="fro"))
+            score = torch.norm(A, p="fro") * torch.norm(G, p="fro")
         elif self.config.score_mode == "spectral_proxy":
-            if diag_mode:
-                # For a diagonal matrix the eigenvalues are the diagonal itself.
+            if ndim == 1:
                 ev_a = A.clamp_min(0)
                 ev_g = G.clamp_min(0)
+            elif ndim == 3:
+                # Eigenvalues of each block; take the global max.
+                ev_a = torch.linalg.eigvalsh(A).clamp_min(0)
+                ev_g = torch.linalg.eigvalsh(G).clamp_min(0)
             else:
                 ev_a = torch.linalg.eigvalsh(A)
                 ev_g = torch.linalg.eigvalsh(G)
@@ -315,12 +383,27 @@ class KFACFisherTracker:
 
     @torch.no_grad()
     def weight_diag_proxy(self, layer_name: str) -> torch.Tensor:
-        """diag(G kron A) = outer(diag(G), diag(A)) reshaped to weight shape."""
+        """diag(G kron A) = outer(diag(G), diag(A)) reshaped to weight shape.
+
+        Works in all three storage modes (diagonal, block-diagonal, full) by
+        extracting the full diagonal via ``RunningCovariance.diagonal()``.
+        """
         module = self.layer_modules[layer_name]
         A, G = self.get_factors(layer_name)
 
-        diag_a = A if A.dim() == 1 else torch.diag(A)
-        diag_g = G if G.dim() == 1 else torch.diag(G)
+        # Extract the full diagonal regardless of storage mode.
+        if A.dim() == 1:
+            diag_a = A
+            diag_g = G
+        elif A.dim() == 3:
+            diag_a = self.a_factors[layer_name].diagonal()
+            diag_g = self.g_factors[layer_name].diagonal()
+            # Re-apply damping to the extracted diagonals.
+            diag_a = diag_a + self.config.damping
+            diag_g = diag_g + self.config.damping
+        else:
+            diag_a = torch.diag(A)
+            diag_g = torch.diag(G)
 
         if self.config.track_bias and module.bias is not None:
             diag_a_w = diag_a[:-1]
@@ -609,7 +692,11 @@ def compute_ties_aligned_deltas(
         vote = torch.zeros_like(base[param_name])
         for i, delta in enumerate(param_deltas):
             w = memory_bank[i] * importance[i]
-            vote = vote + w * torch.sign(delta) * delta.abs()
+            # Pure sign-majority voting: decouple the consensus from raw delta
+            # magnitudes so large outliers can't swamp the election.
+            # (sign(delta) * delta.abs() == delta, which collapses the vote
+            # into a weighted sum of deltas — the magnitude-weighted bug.)
+            vote = vote + w * torch.sign(delta)
         elected_sign = torch.sign(vote)
         for i in range(len(aligned_deltas)):
             delta = aligned_deltas[i][param_name]
@@ -717,6 +804,8 @@ DEFAULT_MAMBA_POLICIES: Dict[str, GroupMergePolicy] = {
     "x_proj":   GroupMergePolicy(drop_rate=0.30, sign_mode="majority",
                                   retain_unanimous_only=False, fisher_power=1.0),
     "dt_proj":  GroupMergePolicy(drop_rate=0.15, sign_mode="majority",
+                                  retain_unanimous_only=False, fisher_power=1.5),
+    "conv1d":   GroupMergePolicy(drop_rate=0.15, sign_mode="majority",
                                   retain_unanimous_only=False, fisher_power=1.5),
     "A_log":    GroupMergePolicy(drop_rate=0.05, sign_mode="majority",
                                   retain_unanimous_only=True, fisher_power=2.0),

@@ -1,6 +1,6 @@
-"""DAPH ExFusion — v4.2.1 (research prototype, not production-hardened)."""
+"""DAPH ExFusion — v4.3 (research prototype, not production-hardened)."""
 
-__version__ = "2026.07.4.2.1"
+__version__ = "2026.07.4.3"
 
 # Core toolkit (always available)
 from .merge_toolkit import (
@@ -44,6 +44,7 @@ try:
         MLXSwiGLUFFN,
         MLXMergedMamba,
         MLXFlashAttention,
+        MLXRotaryEmbedding,
         MLXFNetBlock,
         MLXMacroRouter,
         MLXDAPHDecoderLayer,
@@ -51,7 +52,9 @@ try:
         MLXAdaptiveTopPMacroRouter,
         KVCache,
         SSMState,
+        ConvState,
         MLXStatefulDAPHDecoderLayer,
+        MLXStatefulCausalLM,
         fused_swiglu_epilogue,
         mamba_selective_scan,
         mamba_selective_scan_reference,
@@ -74,6 +77,7 @@ except Exception:
     MLXSwiGLUFFN = None
     MLXMergedMamba = None
     MLXFlashAttention = None
+    MLXRotaryEmbedding = None
     MLXFNetBlock = None
     MLXMacroRouter = None
     MLXDAPHDecoderLayer = None
@@ -81,7 +85,9 @@ except Exception:
     MLXAdaptiveTopPMacroRouter = None
     KVCache = None
     SSMState = None
+    ConvState = None
     MLXStatefulDAPHDecoderLayer = None
+    MLXStatefulCausalLM = None
     fused_swiglu_epilogue = None
     mamba_selective_scan = None
     mamba_selective_scan_reference = None
