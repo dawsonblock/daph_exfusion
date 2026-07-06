@@ -59,15 +59,18 @@ import torch.nn.functional as F
 # =============================================================================
 
 def _extract_linear_weights(expert: nn.Module) -> dict:
-    """Extract up/down weights from a non-SwiGLU expert module.
+    """Extract linear weights from a non-SwiGLU expert module.
 
     Dynamically discovers ``nn.Linear`` layers by recursively traversing
     child modules, rather than relying on hardcoded sequential indices.
     The first ``nn.Linear`` is treated as the "up" projection and the
     last as the "down" projection, matching the standard FFN layout.
+    Any intermediate ``nn.Linear`` layers are included with keys
+    ``mid0.weight``, ``mid0.bias``, ``mid1.weight``, etc.
 
     Handles experts with auxiliary layers (LayerNorm, Dropout, custom
-    activations) interspersed between projections.
+    activations) interspersed between projections, and multi-projection
+    MLPs with more than two linear transformations.
     """
     linears = [m for m in expert.modules() if isinstance(m, nn.Linear)]
     if len(linears) < 2:
@@ -82,6 +85,11 @@ def _extract_linear_weights(expert: nn.Module) -> dict:
     d["down.weight"] = down_layer.weight.data
     if down_layer.bias is not None:
         d["down.bias"] = down_layer.bias.data
+    # Include intermediate linear layers for multi-projection MLPs.
+    for i, mid_layer in enumerate(linears[1:-1]):
+        d[f"mid{i}.weight"] = mid_layer.weight.data
+        if mid_layer.bias is not None:
+            d[f"mid{i}.bias"] = mid_layer.bias.data
     return d
 
 
@@ -1696,11 +1704,18 @@ class MemoryBankExFusionFFN(nn.Module):
                 merged_layers["down"],
             ).to(device)
         else:
-            self.merged_ffn = nn.Sequential(
-                merged_layers["up"],
-                nn.SiLU(),
-                merged_layers["down"],
-            ).to(device)
+            # Build Sequential with SiLU activations between projections.
+            # Supports multi-projection MLPs: up → SiLU → [mid0 → SiLU]* → down
+            seq_modules = [merged_layers["up"], nn.SiLU()]
+            mid_keys = sorted(
+                k for k in merged_layers
+                if k.startswith("mid")
+            )
+            for mk in mid_keys:
+                seq_modules.append(merged_layers[mk])
+                seq_modules.append(nn.SiLU())
+            seq_modules.append(merged_layers["down"])
+            self.merged_ffn = nn.Sequential(*seq_modules).to(device)
 
         self.memory_bank.copy_(active_memory_bank)
         self.is_merged = True

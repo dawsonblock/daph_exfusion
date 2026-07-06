@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daph-exfusion"
-version = "2026.07.4.3.9"
+version = "2026.07.4.4.0"
 description = "DAPH ExFusion: Unified Expert Merging and MLX Native Inference"
 readme = "README.md"
 license = {text = "MIT"}

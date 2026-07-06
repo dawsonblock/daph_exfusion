@@ -22,6 +22,34 @@ from daph_exfusion.merge_toolkit import (
 from daph_exfusion.upgrade_utils import aggregate_kfac_scores_to_experts
 
 
+def offload_experts_to_cpu(exfusion_module: nn.Module) -> None:
+    """Offload all expert parameters in an ExFusion module to CPU memory.
+
+    This frees GPU VRAM during non-active stages of the merge pipeline,
+    allowing large expert configurations (e.g. 7B-scale models) to be
+    processed on consumer GPU hardware.
+    """
+    if not hasattr(exfusion_module, "experts"):
+        return
+    for expert in exfusion_module.experts:
+        for param in expert.parameters():
+            if param.device.type != "cpu":
+                param.data = param.data.to("cpu")
+
+
+def recall_experts_to_gpu(exfusion_module: nn.Module, device: torch.device) -> None:
+    """Move all expert parameters back to the target GPU device.
+
+    Called before calibration or tracking stages that require GPU execution.
+    """
+    if not hasattr(exfusion_module, "experts"):
+        return
+    for expert in exfusion_module.experts:
+        for param in expert.parameters():
+            if param.device.type != device.type or param.device.index != device.index:
+                param.data = param.data.to(device)
+
+
 class _CalibrationModelWrapper(nn.Module):
     """Wrap a single layer so gradients flow through it during calibration."""
 
@@ -46,6 +74,7 @@ class AutomatedMergePipeline:
         max_kfac_batches: int = 5,
         max_fisher_batches: int = 4,
         max_eval_batches: int = 2,
+        enable_memory_offloading: bool = False,
     ) -> None:
         self.layer = pytorch_layer
         self.loader = calibration_loader
@@ -54,6 +83,7 @@ class AutomatedMergePipeline:
         self.max_kfac_batches = max_kfac_batches
         self.max_fisher_batches = max_fisher_batches
         self.max_eval_batches = max_eval_batches
+        self.enable_memory_offloading = enable_memory_offloading
 
     def execute(self, search_space: dict[str, list[Any]] | None = None) -> dict[str, Any]:
         """Run the full ExFusion merge pipeline and return diagnostic data."""
@@ -93,6 +123,12 @@ class AutomatedMergePipeline:
 
         # 3. Compute Fisher diagonals for each expert
         wrapper = _CalibrationModelWrapper(self.layer)
+        device = next(self.layer.parameters()).device
+
+        # Memory offloading: offload Mamba experts while computing FFN Fisher
+        if self.enable_memory_offloading and mamba_expert_scores is not None:
+            offload_experts_to_cpu(self.layer.mamba_path)
+
         fisher_diagonals_ffn = build_fisher_diagonals(
             experts=self.layer.ffn_path.experts,
             dataloader=self.loader,
@@ -100,6 +136,12 @@ class AutomatedMergePipeline:
             loss_fn=self.loss_fn,
             num_batches=self.max_fisher_batches,
         )
+
+        # Recall Mamba experts and offload FFN experts for Mamba Fisher computation
+        if self.enable_memory_offloading:
+            if mamba_expert_scores is not None:
+                recall_experts_to_gpu(self.layer.mamba_path, device)
+                offload_experts_to_cpu(self.layer.ffn_path)
 
         # Compute Mamba Fisher diagonals if the layer has a Mamba path
         mamba_fisher_diagonals = None
@@ -112,6 +154,10 @@ class AutomatedMergePipeline:
                 loss_fn=self.loss_fn,
                 num_batches=self.max_fisher_batches,
             )
+
+        # Recall FFN experts back to GPU for calibration
+        if self.enable_memory_offloading:
+            recall_experts_to_gpu(self.layer.ffn_path, device)
 
         # 4. Launch coordinate-descent search for merge hyperparameters
         if search_space is None:

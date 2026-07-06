@@ -1,5 +1,69 @@
 # Patch Notes
 
+## v4.4.0 — Cooperative Kernel & Systems Hardening (2026-07-05)
+
+Four upgrades extending scalability and closing remaining latent
+vulnerabilities.  Minor version bump reflects the new cooperative kernel
+architecture.
+
+### 1. Cooperative Metal Kernel for d_state > 128
+
+The single-thread-per-channel kernel held the entire `d_state`-sized state
+in per-thread registers, capping at `d_state = 128` to avoid register
+spilling.  Modern Mamba-2 and Jamba models use `d_state = 256, 512, or
+higher`.
+
+Fix: added a cooperative SIMD-group kernel
+(`_get_cooperative_mamba_scan_kernel`) that assigns W=16 threads per
+channel, each handling S = ceil(d_state/W) state elements.  Partial dot
+products are reduced via `simd_sum`.  Per-thread register footprint stays
+small and constant (S <= 256 floats), supporting `d_state` up to 4096.
+
+`mamba_selective_scan` automatically selects the single-thread kernel for
+`d_state <= 128` (lower sync overhead) and the cooperative kernel for
+larger values.  Both kernels are cached per `d_state`.
+
+### 2. Forward-Scoped Ephemeral FFT Cache
+
+The v4.3.9 fix added `x._version` to the cache key, but tensors with
+`_version = 0` (never modified in-place) could still produce false hits
+if PyTorch's allocator recycled their `data_ptr()`.
+
+Fix: registered a `forward_pre_hook` on `DAPHDecoderLayerV2` that clears
+`_fft_cache` at the start of every forward pass.  The cache now lives only
+for the duration of a single forward, making address recycling impossible
+across steps.  Also simplified the cache from a single-entry dict to a
+multi-entry dict keyed directly by the cache key tuple.
+
+### 3. Multi-Projection MLP Topology Support
+
+`_extract_linear_weights` only extracted the first and last `nn.Linear`
+layers, silently discarding intermediate projections in three-stage or
+deeper feed-forward networks.
+
+Fix: intermediate `nn.Linear` layers are now extracted with keys
+`mid0.weight`, `mid0.bias`, `mid1.weight`, etc.  The `merge_to_dense`
+reconstruction builds `nn.Sequential` with SiLU activations between all
+projections: `up → SiLU → [mid_i → SiLU]* → down`.
+
+### 4. K-FAC Memory Offloading for Large Models
+
+Loading all expert copies simultaneously for calibration can cause OOM
+on consumer GPUs when merging 7B-scale models.
+
+Fix: added `enable_memory_offloading` flag to `AutomatedMergePipeline`.
+When enabled, `offload_experts_to_cpu` moves inactive expert parameters to
+CPU RAM during Fisher diagonal computation, and `recall_experts_to_gpu`
+brings them back before calibration.  The pipeline offloads Mamba experts
+while computing FFN Fisher diagonals and vice versa, halving peak VRAM
+usage.
+
+### Test results
+
+- **63 passed, 0 failed** — full green suite maintained.
+
+---
+
 ## v4.3.9 — Architectural Hardening (2026-07-05)
 
 Six fixes addressing cache safety, structural parity, compute efficiency,

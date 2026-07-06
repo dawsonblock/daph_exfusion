@@ -21,4 +21,4 @@ def test_import_merge_toolkit():
 
 def test_import_optional_mlx_does_not_crash():
     import daph_exfusion
-    assert daph_exfusion.__version__ == "2026.07.4.3.9"
+    assert daph_exfusion.__version__ == "2026.07.4.4.0"

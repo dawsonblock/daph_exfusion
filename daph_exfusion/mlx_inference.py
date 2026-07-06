@@ -45,25 +45,28 @@ def fused_swiglu_epilogue(gate_out: mx.array, up_out: mx.array) -> mx.array:
 # Cache of compiled Metal kernels keyed by d_state, so we only compile
 # once per state dimension.
 _mamba_kernel_cache: dict[int, object] = {}
+_cooperative_kernel_cache: dict[int, object] = {}
 
-# Maximum supported d_state — the register array is statically sized to
-# this value to stay within GPU register limits.  Models with larger
-# d_state should use the Python reference path.
-_MAMBA_MAX_D_STATE = 128
+# Threshold above which we switch to the cooperative (multi-thread) kernel.
+# Below this, the single-thread-per-channel kernel is faster (no sync overhead).
+_COOPERATIVE_D_STATE_THRESHOLD = 128
+
+# SIMD group width for cooperative state reduction.
+_SIMD_WIDTH = 16
 
 def _get_mamba_scan_kernel(d_state: int):
-    """Return a compiled Metal kernel for the given d_state.
+    """Return a compiled single-thread Metal kernel for the given d_state.
 
     The kernel source is generated with a statically-sized register array
-    matching the actual d_state, so models with d_state > 16 (e.g. 32, 64)
-    are supported without out-of-bounds writes.  Compiled kernels are
-    cached per d_state to avoid recompilation.
+    matching the actual d_state.  Compiled kernels are cached per d_state.
+    Supports d_state up to _COOPERATIVE_D_STATE_THRESHOLD; larger values
+    should use _get_cooperative_mamba_scan_kernel instead.
     """
-    if d_state > _MAMBA_MAX_D_STATE:
+    if d_state > _COOPERATIVE_D_STATE_THRESHOLD:
         raise ValueError(
-            f"The fused selective scan Metal kernel supports d_state <= "
-            f"{_MAMBA_MAX_D_STATE}. Got d_state = {d_state}. Use a smaller "
-            f"state dimension or fall back to the Python reference."
+            f"Single-thread kernel supports d_state <= "
+            f"{_COOPERATIVE_D_STATE_THRESHOLD}. Got d_state = {d_state}. "
+            f"Use the cooperative kernel path instead."
         )
     if d_state in _mamba_kernel_cache:
         return _mamba_kernel_cache[d_state]
@@ -122,6 +125,98 @@ def _get_mamba_scan_kernel(d_state: int):
     _mamba_kernel_cache[d_state] = kernel
     return kernel
 
+
+def _get_cooperative_mamba_scan_kernel(d_state: int):
+    """Return a cooperative (multi-thread) Metal kernel for large d_state.
+
+    Uses a SIMD-group parallelization strategy: W threads collaborate on
+    each channel, each handling S = ceil(d_state / W) state elements.
+    Partial dot products are reduced via simd_sum, keeping per-thread
+    register footprint small and constant regardless of d_state.
+
+    Supports d_state up to 4096 (W=16, S<=256 floats per thread).
+    """
+    W = _SIMD_WIDTH
+    S = (d_state + W - 1) // W  # ceil division
+
+    if S > 256:
+        raise ValueError(
+            f"Cooperative kernel supports d_state <= {W * 256}. "
+            f"Got d_state = {d_state} (S = {S} > 256)."
+        )
+
+    if d_state in _cooperative_kernel_cache:
+        return _cooperative_kernel_cache[d_state]
+
+    source = f"""
+        uint elem = thread_position_in_grid.x;
+        uint bsz = x_shape[0];
+        uint L   = x_shape[1];
+        uint d   = x_shape[2];       // Model dimension (D)
+        uint d_state = B_shape[2];   // State dimension
+
+        // Each channel is handled by W cooperative threads.
+        // elem encodes both the channel and the thread-within-channel.
+        uint total_channels = bsz * d;
+        uint channel_idx = elem / {W};
+        uint thread_idx_in_channel = elem % {W};
+
+        // Guard: padded threads beyond the needed channel count exit.
+        if (channel_idx >= total_channels) return;
+
+        uint b_idx = channel_idx / d;
+        uint c_idx = channel_idx % d;
+
+        float a_f = -metal::exp((float)A_log[c_idx]);
+
+        // Each thread holds S state elements — small constant register footprint.
+        float h_local[{S}];
+        for (uint i = 0; i < {S}; i++) h_local[i] = 0.0f;
+
+        for (uint t = 0; t < L; t++) {{
+            uint idx_x = (b_idx * L + t) * d + c_idx;
+            float dt_f = (float)delta[idx_x];
+            float xt_f = (float)x[idx_x];
+            float decay = metal::exp(dt_f * a_f);
+
+            // Compute local state recurrence and partial dot product.
+            float partial_dot = 0.0f;
+            for (uint i = 0; i < {S}; i++) {{
+                uint n = thread_idx_in_channel * {S} + i;
+                if (n >= d_state) break;  // Handle non-multiple d_state
+                uint idx_s = (b_idx * L + t) * d_state + n;
+                float Bt_f = (float)B[idx_s];
+                float Ct_f = (float)C[idx_s];
+                h_local[i] = decay * h_local[i] + dt_f * Bt_f * xt_f;
+                partial_dot += Ct_f * h_local[i];
+            }}
+
+            // SIMD-group reduction: sum partial dots across W threads.
+            float final_dot = simd_sum(partial_dot);
+
+            // Only thread 0 writes the output (includes D * x term).
+            if (thread_idx_in_channel == 0) {{
+                y[idx_x] = T(final_dot + (float)D[c_idx] * xt_f);
+            }}
+        }}
+
+        // Coalesced write-back of final state segments.
+        for (uint i = 0; i < {S}; i++) {{
+            uint n = thread_idx_in_channel * {S} + i;
+            if (n >= d_state) break;
+            h_last[(b_idx * d + c_idx) * d_state + n] = T(h_local[i]);
+        }}
+    """
+
+    kernel = mx.fast.metal_kernel(
+        name=f"mamba_cooperative_scan_d{d_state}",
+        input_names=["delta", "A_log", "B", "C", "D", "x"],
+        output_names=["y", "h_last"],
+        source=source,
+    )
+    _cooperative_kernel_cache[d_state] = kernel
+    return kernel
+
 def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
                          C: mx.array, D: mx.array, x: mx.array) -> tuple:
     """Fused Metal selective scan returning both outputs and final state.
@@ -139,12 +234,13 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     the full sequence, captured in the same GPU pass with no Python loop.
 
     .. note::
-        The Metal kernel is dynamically compiled with a register array sized
-        to the actual ``d_state``.  Kernels are cached per ``d_state``.
-        Supports ``d_state`` up to 128; larger values raise ``ValueError``.
+        For ``d_state <= 128``, a single-thread-per-channel kernel is used
+        (minimal sync overhead).  For ``d_state > 128``, a cooperative
+        SIMD-group kernel parallelizes the state dimension across W=16
+        threads, keeping per-thread register footprint at S = ceil(d_state/W)
+        floats.  Kernels are cached per ``d_state``.
     """
     d_state = B.shape[2]
-    kernel = _get_mamba_scan_kernel(d_state)
     dtype = x.dtype
     delta = delta.astype(dtype)
     A_log = A_log.astype(dtype)
@@ -155,14 +251,29 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     y_shape = x.shape
     h_last_shape = (x.shape[0], x.shape[2], d_state)  # (B, D, d_state)
 
-    y, h_last = kernel(
-        inputs=[delta, A_log, B, C, D, x],
-        template=[("T", dtype)],
-        grid=(x.shape[0] * x.shape[2], 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[y_shape, h_last_shape],
-        output_dtypes=[dtype, dtype],
-    )
+    if d_state <= _COOPERATIVE_D_STATE_THRESHOLD:
+        # Single-thread-per-channel kernel — faster for small d_state.
+        kernel = _get_mamba_scan_kernel(d_state)
+        y, h_last = kernel(
+            inputs=[delta, A_log, B, C, D, x],
+            template=[("T", dtype)],
+            grid=(x.shape[0] * x.shape[2], 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[y_shape, h_last_shape],
+            output_dtypes=[dtype, dtype],
+        )
+    else:
+        # Cooperative kernel: W threads per channel, SIMD-group reduction.
+        kernel = _get_cooperative_mamba_scan_kernel(d_state)
+        W = _SIMD_WIDTH
+        y, h_last = kernel(
+            inputs=[delta, A_log, B, C, D, x],
+            template=[("T", dtype)],
+            grid=(x.shape[0] * x.shape[2] * W, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[y_shape, h_last_shape],
+            output_dtypes=[dtype, dtype],
+        )
     return y, h_last
 
 

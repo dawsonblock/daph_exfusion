@@ -166,6 +166,17 @@ class DAPHDecoderLayerV2(nn.Module):
 
         self.final_norm = nn.LayerNorm(hidden_size)
 
+        # Forward-scoped ephemeral cache: cleared at the start of each
+        # forward pass to prevent false cache hits from PyTorch's
+        # caching allocator recycling tensor memory addresses.
+        self._fft_cache = {}
+        self.register_forward_pre_hook(self._clear_ephemeral_cache)
+
+    @staticmethod
+    def _clear_ephemeral_cache(module, inputs):
+        """Clear ephemeral caches at the boundary of each forward pass."""
+        module._fft_cache.clear()
+
     def _cheap_path(self, hidden: torch.Tensor) -> torch.Tensor:
         """Compute the cheap FNet-style path with 2D FFT.
 
@@ -182,16 +193,16 @@ class DAPHDecoderLayerV2(nn.Module):
             return torch.zeros_like(hidden)
         x = self.cheap_norm(hidden)
         # Memoise the FFT based on the normalised tensor's identity.
-        # This avoids recomputing fft2 when the same hidden state is
-        # processed multiple times (e.g. across layers with identical input).
+        # The cache is cleared at each forward boundary by the pre-hook,
+        # so recycled addresses from prior steps cannot cause false hits.
         cache_key = (x.data_ptr(), x._version, x.shape, x.device)
-        if hasattr(self, '_fft_cache') and self._fft_cache.get('key') == cache_key:
-            x_fft = self._fft_cache['value']
+        if cache_key in self._fft_cache:
+            x_fft = self._fft_cache[cache_key]
         else:
             # Upcast to float32 before FFT — torch.fft does not support
             # half-precision (float16/bfloat16) on many GPU and CPU platforms.
             x_fft = torch.fft.fft2(x.float(), dim=(-2, -1)).real.to(x.dtype)
-            self._fft_cache = {'key': cache_key, 'value': x_fft}
+            self._fft_cache[cache_key] = x_fft
         return self.cheap_proj(x_fft)
 
     @staticmethod
