@@ -1,5 +1,37 @@
 # Patch Notes
 
+## v4.3.8 — Metal Shader OOB Guard (2026-07-05)
+
+### 1. Fused Metal Shader Out-Of-Bounds Thread Guard (Critical)
+
+The `_mamba_scan_kernel` Metal shader parallelizes over `B * D` threads
+with a threadgroup size of 256. The GPU driver rounds the execution grid
+up to a multiple of 256, so when `B * D` is not a multiple of 256 (e.g.
+`B=1, D=16` → grid of 16 rounded to 256), padded threads with
+`elem >= B * D` would execute without any bounds check.
+
+These padded threads compute `b_idx = elem / d >= 1` and `c_idx = elem % d`,
+then perform memory reads/writes at `idx_x = (b_idx * L + t) * d + c_idx`,
+which points beyond the allocated tensor bounds. This could cause silent
+memory corruption (overwriting adjacent MLX arrays in unified memory) or
+GPU hardware exceptions if the out-of-bounds address crosses an
+unallocated page boundary.
+
+Fix: added a defensive boundary guard at the top of the Metal shader:
+
+```metal
+if (elem >= bsz * d) return;
+```
+
+Padded threads now exit immediately before any memory access, preventing
+out-of-bounds reads/writes.
+
+### Test results
+
+- **63 passed, 0 failed** — full green suite maintained.
+
+---
+
 ## v4.3.7 — SSM Broadcasting Fix & Bridge/Release Hygiene (2026-07-05)
 
 Five fixes addressing the deep architectural audit of v4.3.6.

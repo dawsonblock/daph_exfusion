@@ -53,6 +53,11 @@ _mamba_scan_kernel = mx.fast.metal_kernel(
         uint d   = x_shape[2];       // Model dimension (D)
         uint d_state = B_shape[2];   // State dimension (typically 16)
 
+        // Guard: the GPU driver may round up the grid to a multiple of the
+        // threadgroup size (256).  Padded threads with elem >= bsz * d must
+        // exit immediately to prevent out-of-bounds memory reads/writes.
+        if (elem >= bsz * d) return;
+
         uint b_idx = elem / d;
         uint c_idx = elem % d;       // channel index in [0, d)
 
