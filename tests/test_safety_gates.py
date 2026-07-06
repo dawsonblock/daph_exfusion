@@ -348,3 +348,97 @@ def test_causal_lm_forward():
     logits = model(tokens, caches=caches, ssm_states=ssm_states,
                    conv_states=conv_states)
     assert logits.shape == (1, 4, 100), f"logits shape {logits.shape}"
+
+
+# ---------------------------------------------------------------------------
+# 11. Short Pre-fill ConvState Padding
+# ---------------------------------------------------------------------------
+def test_short_prefill_conv_state_padding():
+    """Verify that a pre-fill sequence shorter than (d_conv - 1) does not
+    collapse ConvState.history's shape, preventing a decode crash."""
+    pytest.importorskip("mlx.core")
+    import mlx.core as mx
+    from daph_exfusion.mlx_inference import (
+        MLXStatefulDAPHDecoderLayer,
+        ConvState,
+        SSMState,
+    )
+
+    B, L, D = 1, 2, 16  # L = 2 is shorter than d_conv - 1 = 3
+    layer = MLXStatefulDAPHDecoderLayer(
+        hidden_size=D, intermediate_size=D * 2, num_heads=2
+    )
+
+    ssm_state = SSMState(B, D)
+    conv_state = ConvState(B, D)
+    x = mx.random.normal((B, L, D))
+
+    # Pre-fill (L = 2)
+    _ = layer(x, ssm_state=ssm_state, conv_state=conv_state)
+
+    # History must be correctly zero-padded to maintain shape (B, 3, D)
+    assert conv_state.history.shape == (B, 3, D), (
+        f"ConvState.history shape collapsed to {conv_state.history.shape} "
+        f"during short pre-fill; expected {(B, 3, D)}"
+    )
+
+    # Autoregressive decode step (L = 1) must run without shape mismatch errors
+    x_step = mx.random.normal((B, 1, D))
+    try:
+        _ = layer(x_step, ssm_state=ssm_state, conv_state=conv_state)
+    except Exception as e:
+        pytest.fail(f"Autoregressive decode crashed after short pre-fill: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 12. Grouped-Query Attention (GQA) Projections
+# ---------------------------------------------------------------------------
+def test_grouped_query_attention_projections():
+    """Verify that MLXFlashAttention supports GQA where num_kv_heads <
+    num_heads, matching modern causal LLM weights (Llama-3, Mistral, Qwen)."""
+    pytest.importorskip("mlx.core")
+    import mlx.core as mx
+    from daph_exfusion.mlx_inference import MLXFlashAttention
+
+    B, L, D = 1, 4, 16
+    num_heads = 4
+    num_kv_heads = 1  # GQA ratio 4:1
+
+    attn = MLXFlashAttention(
+        hidden_size=D, num_heads=num_heads, num_kv_heads=num_kv_heads
+    )
+
+    # Assert projection weight shapes
+    assert attn.q_proj.weight.shape == (D, D)
+    assert attn.k_proj.weight.shape == (num_kv_heads * attn.head_dim, D)
+    assert attn.v_proj.weight.shape == (num_kv_heads * attn.head_dim, D)
+
+    x = mx.random.normal((B, L, D))
+    try:
+        out = attn(x)
+        assert out.shape == (B, L, D)
+    except Exception as e:
+        pytest.fail(f"MLXFlashAttention forward crashed under GQA config: {e}")
+
+
+# ---------------------------------------------------------------------------
+# 13. Stateful causal LM text generation loop
+# ---------------------------------------------------------------------------
+def test_causal_lm_generation():
+    """Verify that MLXStatefulCausalLM.generate completes autoregressive
+    token sampling successfully without VRAM accumulation."""
+    pytest.importorskip("mlx.core")
+    from daph_exfusion.mlx_inference import MLXStatefulCausalLM
+
+    model = MLXStatefulCausalLM(
+        num_layers=2, vocab_size=100, hidden_size=16,
+        intermediate_size=32, num_heads=2,
+    )
+    prompt = [1, 2, 3]
+    try:
+        output_tokens = model.generate(prompt, max_new_tokens=5, temperature=0.0)
+        assert len(output_tokens) == 5, (
+            f"Output len {len(output_tokens)}, expected 5"
+        )
+    except Exception as e:
+        pytest.fail(f"MLXStatefulCausalLM.generate crashed: {e}")

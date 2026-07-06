@@ -9,6 +9,7 @@ import math
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
+from typing import Optional
 
 # =============================================================================
 # 1. CUSTOM METAL KERNELS (Precise Single-Precision Calculation Boundaries)
@@ -337,18 +338,25 @@ class MLXRotaryEmbedding:
 class MLXFlashAttention(nn.Module):
     """Separate Q/K/V/O projections with optional Rotary Position Embeddings.
 
-    RoPE is applied to Q and K before the scaled dot-product attention,
-    matching the architecture of modern autoregressive Transformers (Llama,
-    Mistral, Qwen).  Set ``use_rope=False`` to disable for ablations.
+    Supports Grouped-Query Attention (GQA) and Multi-Query Attention (MQA)
+    via the ``num_kv_heads`` parameter.  When ``num_kv_heads < num_heads``,
+    K and V projections produce fewer heads and MLX's
+    ``scaled_dot_product_attention`` natively broadcasts them across query
+    groups, matching the architecture of modern causal Transformers
+    (Llama-3, Mistral, Qwen).  Set ``use_rope=False`` to disable RoPE.
     """
-    def __init__(self, hidden_size: int, num_heads: int, bias: bool = False,
+    def __init__(self, hidden_size: int, num_heads: int,
+                 num_kv_heads: Optional[int] = None, bias: bool = False,
                  use_rope: bool = True, max_position_embeddings: int = 4096):
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = hidden_size // num_heads
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
+        # K/V projections produce num_kv_heads * head_dim, not hidden_size
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.k_proj = nn.Linear(hidden_size, kv_dim, bias=bias)
+        self.v_proj = nn.Linear(hidden_size, kv_dim, bias=bias)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.use_rope = use_rope
         if use_rope:
@@ -360,14 +368,15 @@ class MLXFlashAttention(nn.Module):
                  offset: int = 0) -> mx.array:
         B, L, D = x.shape
         q = self.q_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = self.v_proj(x).reshape(B, L, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, L, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
         # Apply Rotary Position Embeddings to Q and K
         if self.rope is not None:
             q, k = self.rope.apply_rope(q, k, offset=offset)
 
         scale = 1.0 / math.sqrt(self.head_dim)
+        # MLX SDPA natively broadcasts K/V for GQA/MQA (num_kv_heads < num_heads)
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
         out = out.transpose(0, 2, 1, 3).reshape(B, L, D)
@@ -376,10 +385,12 @@ class MLXFlashAttention(nn.Module):
 
 class MLXAttentionPath(nn.Module):
     """Proper MLX module wrapper so parameters register cleanly in structural layers."""
-    def __init__(self, hidden_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, num_heads: int,
+                 num_kv_heads: Optional[int] = None):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size)
-        self.attn = MLXFlashAttention(hidden_size, num_heads)
+        self.attn = MLXFlashAttention(hidden_size, num_heads,
+                                      num_kv_heads=num_kv_heads)
 
     def __call__(self, x: mx.array, mask: mx.array = None,
                  offset: int = 0) -> mx.array:
@@ -427,10 +438,12 @@ class MLXMacroRouter(nn.Module):
 
 
 class MLXDAPHDecoderLayer(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int,
+                 num_kv_heads: Optional[int] = None):
         super().__init__()
         self.macro_router = MLXMacroRouter(hidden_size)
-        self.attention_path = MLXAttentionPath(hidden_size, num_heads)
+        self.attention_path = MLXAttentionPath(hidden_size, num_heads,
+                                               num_kv_heads=num_kv_heads)
         self.ffn_path = MLXSwiGLUFFN(hidden_size, intermediate_size)
         self.mamba_path = MLXMergedMamba(hidden_size)
         self.cheap_path = MLXFNetBlock(hidden_size)
@@ -611,9 +624,16 @@ class ConvState:
         self.history = mx.zeros((bsz, kernel_size - 1, d_model), dtype=dtype)
 
     def update(self, x_new: mx.array) -> mx.array:
-        """Append ``x_new`` (B, 1, D) and return the full conv window (B, k, D)."""
-        self.history = mx.concatenate([self.history[:, 1:, :], x_new], axis=1)
-        return self.history
+        """Append ``x_new`` (B, 1, D) and return the full conv window (B, k, D).
+
+        The returned window has ``kernel_size`` elements in the sequence
+        dimension: the ``kernel_size - 1`` stored history items plus the
+        new input.  The history is then trimmed to the last
+        ``kernel_size - 1`` items for the next call.
+        """
+        window = mx.concatenate([self.history, x_new], axis=1)  # (B, k, D)
+        self.history = window[:, 1:, :]  # keep last k-1 for next step
+        return window
 
 
 class MLXStatefulDAPHDecoderLayer(nn.Module):
@@ -621,10 +641,12 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
     Stateful DAPH decoder layer with adaptive top-p routing,
     KV-cache for attention, and SSM state for Mamba.
     """
-    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, num_heads: int,
+                 num_kv_heads: Optional[int] = None):
         super().__init__()
         self.macro_router = MLXAdaptiveTopPMacroRouter(hidden_size, num_paths=3)
-        self.attention_path = MLXAttentionPath(hidden_size, num_heads)
+        self.attention_path = MLXAttentionPath(hidden_size, num_heads,
+                                               num_kv_heads=num_kv_heads)
         self.ffn_path = MLXSwiGLUFFN(hidden_size, intermediate_size)
         self.mamba_path = MLXMergedMamba(hidden_size)
         self.cheap_path = MLXFNetBlock(hidden_size)
@@ -676,17 +698,26 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
             v = self.attention_path.attn.v_proj(norm_hidden)
 
             num_heads = self.attention_path.attn.num_heads
+            num_kv_heads = self.attention_path.attn.num_kv_heads
             head_dim = D // num_heads
 
-            # Reshape to (B, num_heads, L, head_dim) to match scaled_dot_product_attention API
+            # Reshape to (B, num_heads, L, head_dim) for Q and
+            # (B, num_kv_heads, L, head_dim) for K/V (GQA/MQA support)
             q = q.reshape(B, L, num_heads, head_dim).transpose(0, 2, 1, 3)
-            k = k.reshape(B, L, num_heads, head_dim).transpose(0, 2, 1, 3)
-            v = v.reshape(B, L, num_heads, head_dim).transpose(0, 2, 1, 3)
+            k = k.reshape(B, L, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+            v = v.reshape(B, L, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+
+            # Apply RoPE before caching, using the current cache length as
+            # the position offset so cached keys keep their original positions.
+            if self.attention_path.attn.rope is not None:
+                offset = 0 if kv_cache.keys is None else kv_cache.keys.shape[2]
+                q, k = self.attention_path.attn.rope.apply_rope(q, k, offset=offset)
 
             # Update cache with new keys/values (concatenate along sequence dimension)
             keys, values = kv_cache.update(k, v)
 
-            # Scaled dot product attention over full cached sequence
+            # Scaled dot product attention over full cached sequence.
+            # MLX SDPA natively broadcasts K/V for GQA (num_kv_heads < num_heads).
             scale = 1.0 / math.sqrt(head_dim)
             attn_out = mx.fast.scaled_dot_product_attention(q, keys, values, scale=scale, mask=mask)
 
@@ -752,10 +783,24 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
 
                 # Seed the ConvState with the last (d_conv - 1) projected
                 # inputs so subsequent single-token decoding steps have the
-                # correct conv window.
+                # correct conv window.  When the pre-fill sequence is shorter
+                # than the conv history window (L < d_conv - 1), left-pad
+                # with zeros to preserve the (B, d_conv - 1, D) shape;
+                # otherwise the slice collapses the history dimension and
+                # crashes the first decoding step.
                 if conv_state is not None:
                     k = self.mamba_path.d_conv
-                    conv_state.history = u[:, -(k - 1):, :].astype(conv_state.history.dtype)
+                    history_len = k - 1
+                    if u.shape[1] >= history_len:
+                        conv_state.history = u[:, -history_len:, :].astype(
+                            conv_state.history.dtype
+                        )
+                    else:
+                        pad_len = history_len - u.shape[1]
+                        pad = mx.zeros((B, pad_len, D), dtype=u.dtype)
+                        conv_state.history = mx.concatenate(
+                            [pad, u], axis=1
+                        ).astype(conv_state.history.dtype)
             else:
                 # Pure stateless mode — no state capture needed
                 mamba_out = self.mamba_path(hidden)
@@ -808,13 +853,15 @@ class MLXStatefulCausalLM(nn.Module):
     """
 
     def __init__(self, num_layers: int, vocab_size: int, hidden_size: int,
-                 intermediate_size: int, num_heads: int):
+                 intermediate_size: int, num_heads: int,
+                 num_kv_heads: Optional[int] = None):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_size = hidden_size
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = [
-            MLXStatefulDAPHDecoderLayer(hidden_size, intermediate_size, num_heads)
+            MLXStatefulDAPHDecoderLayer(hidden_size, intermediate_size,
+                                        num_heads, num_kv_heads=num_kv_heads)
             for _ in range(num_layers)
         ]
         self.norm = nn.LayerNorm(hidden_size)
@@ -852,3 +899,84 @@ class MLXStatefulCausalLM(nn.Module):
 
         x = self.norm(x)
         return self.lm_head(x)
+
+    def generate(self, prompt_tokens: list, max_new_tokens: int = 64,
+                 temperature: float = 0.0, seed: int = 42) -> list:
+        """Generate tokens autoregressively from a prompt.
+
+        Ensures memory stability across generation cycles by triggering
+        ``mx.eval()`` on step outputs, pruning the lazy evaluation graph to
+        prevent VRAM accumulation during long generation runs.
+
+        Args:
+            prompt_tokens: List of integer token IDs to seed generation.
+            max_new_tokens: Number of new tokens to generate.
+            temperature: Sampling temperature; 0.0 means greedy argmax.
+            seed: Random seed for reproducible sampling.
+
+        Returns:
+            List of generated token IDs (length ``max_new_tokens``).
+        """
+        mx.random.seed(seed)
+
+        B = 1
+        D = self.hidden_size
+
+        # Instantiate per-layer states
+        caches = [KVCache() for _ in range(self.num_layers)]
+        ssm_states = [SSMState(B, D) for _ in range(self.num_layers)]
+        conv_states = [ConvState(B, D) for _ in range(self.num_layers)]
+
+        # --- Phase 1: Pre-fill ------------------------------------------------
+        tokens_arr = mx.array([prompt_tokens])  # (1, L_prompt)
+        logits = self(tokens_arr, caches=caches, ssm_states=ssm_states,
+                       conv_states=conv_states)
+
+        last_logits = logits[:, -1, :]
+        if temperature > 0:
+            next_token = mx.random.categorical(
+                last_logits / temperature, num_samples=1
+            )
+        else:
+            next_token = mx.argmax(last_logits, axis=-1, keepdims=True)
+
+        generated_tokens = [int(next_token.item())]
+        current_len = len(prompt_tokens)
+
+        # Force evaluation of the pre-fill graph to release intermediate tensors
+        mx.eval(next_token)
+        for c in caches:
+            if c.keys is not None:
+                mx.eval(c.keys, c.values)
+        for s in ssm_states:
+            mx.eval(s.h)
+        for c in conv_states:
+            mx.eval(c.history)
+
+        # --- Phase 2: Autoregressive decoding --------------------------------
+        for _ in range(max_new_tokens - 1):
+            logits = self(next_token, caches=caches, ssm_states=ssm_states,
+                          conv_states=conv_states, offset=current_len)
+
+            last_logits = logits[:, -1, :]
+            if temperature > 0:
+                next_token = mx.random.categorical(
+                    last_logits / temperature, num_samples=1
+                )
+            else:
+                next_token = mx.argmax(last_logits, axis=-1, keepdims=True)
+
+            generated_tokens.append(int(next_token.item()))
+            current_len += 1
+
+            # Prune the lazy evaluation graph to prevent VRAM accumulation
+            mx.eval(next_token)
+            for c in caches:
+                if c.keys is not None:
+                    mx.eval(c.keys, c.values)
+            for s in ssm_states:
+                mx.eval(s.h)
+            for c in conv_states:
+                mx.eval(c.history)
+
+        return generated_tokens

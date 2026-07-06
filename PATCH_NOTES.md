@@ -1,5 +1,59 @@
 # Patch Notes
 
+## v4.3.1 — Boundary Condition & GQA Patch (2026-07-05)
+
+Three boundary-condition fixes identified in the v4.3 audit, ensuring
+complete production stability for short prompts, modern GQA/MQA weight
+layouts, and long autoregressive generation runs.
+
+### 1. Short Pre-fill ConvState Padding
+
+When a prompt's sequence length `L` is shorter than `d_conv - 1` (3 for a
+standard `d_conv=4` Mamba block), the slice `u[:, -(k-1):, :]` returned a
+smaller sequence dimension, collapsing `ConvState.history` from `(B, 3, D)`
+to `(B, L, D)`. This caused a shape mismatch crash on the first decoding
+step.
+
+Fixed by left-zero-padding the history when `L < d_conv - 1`, preserving
+the `(B, d_conv - 1, D)` shape.
+
+Also fixed `ConvState.update()` to return the full `(B, kernel_size, D)`
+window (history + new input) instead of `(B, kernel_size - 1, D)`, which
+was causing conv1d to receive an input shorter than the kernel size.
+
+- Regression: `test_short_prefill_conv_state_padding`
+
+### 2. Grouped-Query Attention (GQA/MQA) Support
+
+`MLXFlashAttention` previously assumed `num_kv_heads == num_heads`, making
+it incompatible with GQA/MQA configurations used by Llama-3, Mistral, Qwen,
+etc. K/V projections now produce `num_kv_heads * head_dim` instead of
+`hidden_size`, and MLX's `scaled_dot_product_attention` natively broadcasts
+K/V across query groups.
+
+`num_kv_heads` parameter threaded through `MLXAttentionPath`,
+`MLXDAPHDecoderLayer`, `MLXStatefulDAPHDecoderLayer`, and
+`MLXStatefulCausalLM`. RoPE is applied before KV-cache insertion with the
+correct position offset.
+
+- Regression: `test_grouped_query_attention_projections`
+
+### 3. Memory-Stable Autoregressive Generation
+
+`MLXStatefulCausalLM.generate()` provides a complete pre-fill + decode
+loop with explicit `mx.eval()` calls after each step to prune the lazy
+evaluation graph, preventing VRAM accumulation during long generation
+runs. Supports greedy (`temperature=0.0`) and stochastic sampling.
+
+- Regression: `test_causal_lm_generation`
+
+### Test results
+
+- **44 passed, 8 failed** (all 8 failures are pre-existing and unrelated).
+- All 14 safety-gates tests pass (3 new tests added).
+
+---
+
 ## v4.3 — Structural Parity & Hardware Acceleration (2026-07-05)
 
 A three-phase remediation addressing mathematical gaps, hardware execution

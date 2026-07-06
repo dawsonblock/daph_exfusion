@@ -1,6 +1,6 @@
-"""DAPH ExFusion — v4.3 (research prototype, not production-hardened)."""
+"""DAPH ExFusion — v4.3.1 (research prototype, not production-hardened)."""
 
-__version__ = "2026.07.4.3"
+__version__ = "2026.07.4.3.1"
 
 # Core toolkit (always available)
 from .merge_toolkit import (
