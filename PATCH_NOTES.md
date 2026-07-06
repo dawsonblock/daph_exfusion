@@ -1,5 +1,77 @@
 # Patch Notes
 
+## v4.3.5 — Real-World Model Compatibility (2026-07-05)
+
+Five structural fixes enabling compatibility with real-world large-scale
+causal models (LLaMA-3, Mistral, Mamba-130M, Jamba).
+
+### 1. Mamba State Dimension (d_state) Decoupling (Critical)
+
+`MLXMergedMamba` hardcoded `x_proj_B` and `x_proj_C` to output `d_model`
+(e.g. 2048), but standard Mamba-1/2 models use `d_state=16`. This caused
+weight loading failures and would result in out-of-bounds reads in the
+Metal kernel if validation was bypassed.
+
+Fix: `MLXMergedMamba` now accepts `d_state` (default 16). B/C projections
+output `d_state`. The Metal kernel indexes B/C using `d_state` from
+`B_shape[2]`. The SSM state now has shape `(B, D, d_state)` instead of
+`(B, D)`, matching the standard Mamba architecture where each channel
+maintains a `d_state`-dimensional state vector.
+
+Updated: `MLXMergedMamba`, `_mamba_scan_kernel`, `mamba_selective_scan`,
+`mamba_selective_scan_reference`, `SSMState`, `MLXStatefulDAPHDecoderLayer`
+(single-step decode path), `MLXStatefulCausalLM`, `test_scan_correctness`,
+`test_scan_with_real_weights`.
+
+PyTorch `make_mamba_factory` in `demo.py` also updated to use `d_state`.
+
+### 2. GQA Support in PyTorch Attention Path
+
+`SimpleAttention` and `PyTAttentionPath` in `demo.py` were hardcoded to
+MHA (`num_kv_heads == num_heads`), preventing K-FAC tracking and Fisher
+profiling on GQA models (LLaMA-3, Mistral, Qwen-2) before merging.
+
+Fix: added `num_kv_heads` parameter. K/V projections produce
+`num_kv_heads * head_dim`. When `num_kv_heads < num_heads`, K/V are
+repeat-interleaved to match the query head count.
+
+Also fixed `torch.silu` → `F.silu` in the demo Mamba block.
+
+### 3. Half-Precision FFT Safety
+
+`torch.fft.fft2` does not support `float16` or `bfloat16` on many
+platforms, causing runtime crashes during half-precision inference.
+
+Fix: `_cheap_path` now upcasts to `float32` before FFT and casts back to
+the original dtype afterward.
+
+### 4. Low-Rank Frobenius Norm Damping Correction
+
+`layer_score()` with `score_mode="fro"` computed `||s_damped||` which
+misses the damping energy of the inactive `(D - k)` dimensions:
+`d^2 * (D - k)`.
+
+Fix: `||A||_F^2 = sum(s_damped^2) + d^2 * (D - k)`, correctly accounting
+for isotropic damping across the full dimension.
+
+### 5. torch.compile Compatibility Switch
+
+The packed token dispatch (`_packed_dispatch`) uses dynamic boolean
+slicing (`nonzero()`) which causes graph breaks under `torch.compile`,
+triggering JIT recompilation on every forward step.
+
+Fix: added `use_packed_dispatch` flag (default `True`) to
+`DAPHDecoderLayerV2`. Set to `False` when using `torch.compile` to
+disable packed dispatch and use the static full-sequence path.
+
+### Test results
+
+- **61 passed, 0 failed** — full green suite maintained.
+- Updated `test_ssm_state_update` and `test_mamba_selective_scan_returns_state`
+  to expect the new `(B, D, d_state)` state shape.
+
+---
+
 ## v4.3.4 — Full Test Suite Green (2026-07-05)
 
 Resolves all 8 remaining pre-existing test failures, achieving a 100%

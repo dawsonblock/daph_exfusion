@@ -47,32 +47,46 @@ _mamba_scan_kernel = mx.fast.metal_kernel(
     input_names=["delta", "A_log", "B", "C", "D", "x"],
     output_names=["y", "h_last"],
     source="""
-        uint elem = thread_position_in_grid.x;   
+        uint elem = thread_position_in_grid.x;
         uint bsz = x_shape[0];
         uint L   = x_shape[1];
-        uint d   = x_shape[2];
+        uint d   = x_shape[2];       // Model dimension (D)
+        uint d_state = B_shape[2];   // State dimension (typically 16)
 
         uint b_idx = elem / d;
-        uint c_idx = elem % d;
+        uint c_idx = elem % d;       // channel index in [0, d)
 
         float a_f = -metal::exp((float)A_log[c_idx]);
-        float state_f = 0.0f;
+
+        // Standard Mamba SSM: each channel c has a d_state-dimensional state.
+        // h[t, n] = decay * h[t-1, n] + dt[t] * B[t, n] * x[t, c]
+        // y[t, c] = sum_n C[t, n] * h[t, n] + D[c] * x[t, c]
+        //
+        // We loop over state dimensions in the outer loop so we can
+        // accumulate y[t] across all n for each timestep.
+        float h_states[16];  // d_state <= 16 (standard Mamba)
+        for (uint n = 0; n < d_state; n++) h_states[n] = 0.0f;
 
         for (uint t = 0; t < L; t++) {
-            uint idx = (b_idx * L + t) * d + c_idx;
-            float dt_f = (float)delta[idx];
-            float Bt_f = (float)B[idx];
-            float Ct_f = (float)C[idx];
-            float xt_f = (float)x[idx];
-
+            uint idx_x = (b_idx * L + t) * d + c_idx;
+            float dt_f = (float)delta[idx_x];
+            float xt_f = (float)x[idx_x];
             float decay = metal::exp(dt_f * a_f);
-            state_f = decay * state_f + dt_f * Bt_f * xt_f;
 
-            y[idx] = T(Ct_f * state_f + (float)D[c_idx] * xt_f);
+            float y_acc = (float)D[c_idx] * xt_f;
+            for (uint n = 0; n < d_state; n++) {
+                uint idx_s = (b_idx * L + t) * d_state + n;
+                float Bt_f = (float)B[idx_s];
+                float Ct_f = (float)C[idx_s];
+                h_states[n] = decay * h_states[n] + dt_f * Bt_f * xt_f;
+                y_acc += Ct_f * h_states[n];
+            }
+            y[idx_x] = T(y_acc);
         }
-        // Write the final recurrent state directly from the GPU register,
-        // eliminating the need for a sequential Python pre-fill loop.
-        h_last[b_idx * d + c_idx] = T(state_f);
+        // Write final state: (B, D, d_state) layout
+        for (uint n = 0; n < d_state; n++) {
+            h_last[(b_idx * d + c_idx) * d_state + n] = T(h_states[n]);
+        }
     """,
 )
 
@@ -80,9 +94,17 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
                          C: mx.array, D: mx.array, x: mx.array) -> tuple:
     """Fused Metal selective scan returning both outputs and final state.
 
+    Args:
+        delta: (B, L, D) — discretization step
+        A_log: (D,) — log of diagonal A matrix
+        B: (B, L, d_state) — input-dependent B matrix
+        C: (B, L, d_state) — input-dependent C matrix
+        D: (D,) — feedthrough
+        x: (B, L, D) — input sequence
+
     Returns ``(y, h_last)`` where ``y`` has shape ``(B, L, D)`` and ``h_last``
-    has shape ``(B, D)`` — the final recurrent state after processing the
-    full sequence, captured in the same GPU pass with no Python loop.
+    has shape ``(B, D, d_state)`` — the final recurrent state after processing
+    the full sequence, captured in the same GPU pass with no Python loop.
     """
     dtype = x.dtype
     delta = delta.astype(dtype)
@@ -90,9 +112,10 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     B = B.astype(dtype)
     C = C.astype(dtype)
     D = D.astype(dtype)
-    
+
+    d_state = B.shape[2]
     y_shape = x.shape
-    h_last_shape = (x.shape[0], x.shape[2])  # (B, D)
+    h_last_shape = (x.shape[0], x.shape[2], d_state)  # (B, D, d_state)
 
     y, h_last = _mamba_scan_kernel(
         inputs=[delta, A_log, B, C, D, x],
@@ -106,20 +129,32 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
 
 
 def mamba_selective_scan_reference(delta: mx.array, A_log: mx.array, B: mx.array, C: mx.array, D: mx.array, x: mx.array) -> mx.array:
-    """Pure-MLX Python loop reference for correctness checks."""
+    """Pure-MLX Python loop reference for correctness checks.
+
+    Args:
+        delta: (B, L, D), A_log: (D,), B: (B, L, d_state), C: (B, L, d_state)
+        D: (D,), x: (B, L, D)
+    """
     bsz, L, d = x.shape
-    a = -mx.exp(A_log)
-    state = mx.zeros((bsz, d))
+    d_state = B.shape[2]
+    a = -mx.exp(A_log)  # (D,)
+    # State: (B, D, d_state)
+    state = mx.zeros((bsz, d, d_state))
     ys = []
     for t in range(L):
-        dt = delta[:, t, :]
-        Bt = B[:, t, :]
-        Ct = C[:, t, :]
-        xt = x[:, t, :]
+        dt = delta[:, t, :]  # (B, D)
+        Bt = B[:, t, :]      # (B, d_state)
+        Ct = C[:, t, :]      # (B, d_state)
+        xt = x[:, t, :]      # (B, D)
 
-        decay = mx.exp(dt * a)
-        state = decay * state + dt * Bt * xt
-        yt = Ct * state + D * xt
+        # decay: (B, D) — broadcast over d_state
+        decay = mx.exp(dt * a[:, None])  # (B, D, 1) via broadcasting
+        # state = decay * state + dt * Bt * xt
+        # dt: (B, D), Bt: (B, d_state), xt: (B, D)
+        # contribution: (B, D, d_state) = dt[:,:,None] * Bt[:,None,:] * xt[:,:,None]
+        state = decay * state + dt[:, :, None] * Bt[:, None, :] * xt[:, :, None]
+        # y = sum_n C[t,n] * h[t,n] + D * x[t]
+        yt = (Ct[:, None, :] * state).sum(axis=-1) + D[None, :] * xt  # (B, D)
         ys.append(yt)
     return mx.stack(ys, axis=1)
 
@@ -154,15 +189,15 @@ def ssm_prefill_loop(delta: mx.array, Bc: mx.array, u: mx.array,
     return state
 
 
-def test_scan_correctness(B: int = 2, L: int = 8, D: int = 16, atol: float = 1e-5) -> bool:
+def test_scan_correctness(B: int = 2, L: int = 8, D: int = 16, d_state: int = 16, atol: float = 1e-5) -> bool:
     """Verify the fused Metal kernel matches the pure-Python reference loop.
 
     Checks both the output sequence ``y`` and the final state ``h_last``.
     """
     delta = mx.random.normal((B, L, D))
     A_log = mx.random.normal((D,))
-    Bv = mx.random.normal((B, L, D))
-    C = mx.random.normal((B, L, D))
+    Bv = mx.random.normal((B, L, d_state))
+    C = mx.random.normal((B, L, d_state))
     Dv = mx.random.normal((D,))
     x = mx.random.normal((B, L, D))
 
@@ -173,18 +208,18 @@ def test_scan_correctness(B: int = 2, L: int = 8, D: int = 16, atol: float = 1e-
 
     # Verify h_last by replaying the reference recurrence to get the final state.
     a = -mx.exp(A_log)
-    state_ref = mx.zeros((B, D))
+    state_ref = mx.zeros((B, D, d_state))
     for t in range(L):
-        decay = mx.exp(delta[:, t, :] * a)
-        state_ref = decay * state_ref + delta[:, t, :] * Bv[:, t, :] * x[:, t, :]
+        decay = mx.exp(delta[:, t, :] * a[:, None])  # (B, D, 1)
+        state_ref = decay * state_ref + delta[:, t, :, None] * Bv[:, t, None, :] * x[:, t, :, None]
     h_match = np.allclose(np.array(state_ref), np.array(h_last), atol=atol)
 
     return bool(y_match and h_match)
 
 
-def test_scan_with_real_weights(d_model: int = 64, L: int = 16, atol: float = 1e-4) -> bool:
+def test_scan_with_real_weights(d_model: int = 64, L: int = 16, d_state: int = 16, atol: float = 1e-4) -> bool:
     """End-to-end scan correctness with a real MLXMergedMamba module."""
-    mamba = MLXMergedMamba(d_model)
+    mamba = MLXMergedMamba(d_model, d_state=d_state)
     x = mx.random.normal((1, L, d_model))
     y = mamba(x)
     # Also run via the reference path for comparison
@@ -224,18 +259,28 @@ class MLXMergedMamba(nn.Module):
     (kernel width 4) is applied after the input projection gating and before
     the selective scan.  This is required for loading real-world pre-trained
     Mamba weights.
+
+    Args:
+        d_model: Model hidden dimension (D).
+        d_conv: Convolution kernel size (default 4).
+        d_state: SSM state dimension (default 16, matching Mamba-1).
+            B and C projections output d_state, not d_model.  The SSM state
+            has shape (B, D, d_state).
     """
-    def __init__(self, d_model: int, d_conv: int = 4):
+    def __init__(self, d_model: int, d_conv: int = 4, d_state: int = 16):
         super().__init__()
         self.d_model = d_model
         self.d_conv = d_conv
+        self.d_state = d_state
         self.in_proj = nn.Linear(d_model, d_model * 2, bias=False)
         self.out_proj = nn.Linear(d_model, d_model, bias=False)
         # Standard depthwise 1D convolution (kernel=4, causal left-padding)
         self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=d_conv,
                                 stride=1, padding=0, groups=d_model, bias=True)
-        self.x_proj_B = nn.Linear(d_model, d_model, bias=False)
-        self.x_proj_C = nn.Linear(d_model, d_model, bias=False)
+        # Project to state dimension (e.g. 16), not d_model — this matches
+        # the standard Mamba architecture where B/C operate in d_state space.
+        self.x_proj_B = nn.Linear(d_model, d_state, bias=False)
+        self.x_proj_C = nn.Linear(d_model, d_state, bias=False)
         self.dt_proj = nn.Linear(d_model, d_model, bias=False)
         self.A_log = mx.zeros((d_model,))
         self.D = mx.zeros((d_model,))
@@ -621,9 +666,13 @@ class KVCache:
 
 
 class SSMState:
-    """Mamba SSM hidden state container."""
-    def __init__(self, bsz: int, d_model: int, dtype=mx.float32):
-        self.h = mx.zeros((bsz, d_model), dtype=dtype)
+    """Mamba SSM hidden state container.
+
+    The state has shape (B, D, d_state) where D is the model dimension and
+    d_state is the SSM state dimension (typically 16).
+    """
+    def __init__(self, bsz: int, d_model: int, d_state: int = 16, dtype=mx.float32):
+        self.h = mx.zeros((bsz, d_model, d_state), dtype=dtype)
 
     def update(self, h_new: mx.array):
         self.h = h_new
@@ -760,18 +809,24 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
                 u = nn.silu(u_conv)
 
             # Delta, B and C projections
+            # B and C now project to d_state (e.g. 16), not d_model
+            d_state = self.mamba_path.d_state
             delta = nn.softplus(self.mamba_path.dt_proj(u)).squeeze(1)  # (B, D)
-            Bc = self.mamba_path.x_proj_B(u).squeeze(1)               # (B, D)
-            Cc = self.mamba_path.x_proj_C(u).squeeze(1)               # (B, D)
+            Bc = self.mamba_path.x_proj_B(u).squeeze(1)               # (B, d_state)
+            Cc = self.mamba_path.x_proj_C(u).squeeze(1)               # (B, d_state)
             u_sq = u.squeeze(1)                                       # (B, D)
 
-            # Compute decay factor and update recurrent state
-            decay = mx.exp(delta * -mx.exp(self.mamba_path.A_log))      # (D,) broadcasted
-            h_new = decay * ssm_state.h + (delta * Bc * u_sq)           # (B, D)
+            # Compute decay factor and update recurrent state.
+            # State has shape (B, D, d_state).
+            # decay: (B, D, 1) — broadcast over d_state
+            a = -mx.exp(self.mamba_path.A_log)  # (D,)
+            decay = mx.exp(delta * a[:, None])  # (B, D, 1) via broadcasting
+            # contribution: dt[:,:,None] * Bt[:,None,:] * xt[:,:,None]
+            h_new = decay * ssm_state.h + delta[:, :, None] * Bc[:, None, :] * u_sq[:, :, None]
             ssm_state.update(h_new)
 
-            # Output step: C * h_new + D * u
-            y_step = Cc * h_new + self.mamba_path.D * u_sq
+            # Output step: y = sum_n C[n] * h[n] + D * x
+            y_step = (Cc[:, None, :] * h_new).sum(axis=-1) + self.mamba_path.D * u_sq  # (B, D)
             mamba_out = self.mamba_path.out_proj(y_step[:, None, :])    # (B, 1, D)
         else:
             # Full sequence selective scan for stateless mode
@@ -788,8 +843,8 @@ class MLXStatefulDAPHDecoderLayer(nn.Module):
                 u = nn.silu(self.mamba_path._causal_conv1d(u))
 
                 delta = nn.softplus(self.mamba_path.dt_proj(u))  # (B, L, D)
-                Bc = self.mamba_path.x_proj_B(u)  # (B, L, D)
-                Cc = self.mamba_path.x_proj_C(u)  # (B, L, D)
+                Bc = self.mamba_path.x_proj_B(u)  # (B, L, d_state)
+                Cc = self.mamba_path.x_proj_C(u)  # (B, L, d_state)
 
                 y_seq, h_last = mamba_selective_scan(
                     delta, self.mamba_path.A_log, Bc, Cc, self.mamba_path.D, u
@@ -876,10 +931,11 @@ class MLXStatefulCausalLM(nn.Module):
 
     def __init__(self, num_layers: int, vocab_size: int, hidden_size: int,
                  intermediate_size: int, num_heads: int,
-                 num_kv_heads: Optional[int] = None):
+                 num_kv_heads: Optional[int] = None, d_state: int = 16):
         super().__init__()
         self.num_layers = num_layers
         self.hidden_size = hidden_size
+        self.d_state = d_state
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
         self.layers = [
             MLXStatefulDAPHDecoderLayer(hidden_size, intermediate_size,
@@ -946,7 +1002,7 @@ class MLXStatefulCausalLM(nn.Module):
 
         # Instantiate per-layer states
         caches = [KVCache() for _ in range(self.num_layers)]
-        ssm_states = [SSMState(B, D) for _ in range(self.num_layers)]
+        ssm_states = [SSMState(B, D, self.d_state) for _ in range(self.num_layers)]
         conv_states = [ConvState(B, D) for _ in range(self.num_layers)]
 
         # --- Phase 1: Pre-fill ------------------------------------------------

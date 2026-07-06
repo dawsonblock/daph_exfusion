@@ -65,11 +65,11 @@ def test_kv_cache_update():
 
 
 def test_ssm_state_update():
-    bsz, d_model = 2, 16
-    state = SSMState(bsz, d_model)
-    assert np.array(state.h).shape == (bsz, d_model)
+    bsz, d_model, d_state = 2, 16, 16
+    state = SSMState(bsz, d_model, d_state)
+    assert np.array(state.h).shape == (bsz, d_model, d_state)
 
-    new_h = mx.random.normal((bsz, d_model))
+    new_h = mx.random.normal((bsz, d_model, d_state))
     state.update(new_h)
     assert np.allclose(np.array(state.h), np.array(new_h))
 

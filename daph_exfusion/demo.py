@@ -14,6 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 from daph_exfusion.merge_toolkit import (
     MemoryBankExFusionFFN,
@@ -23,22 +24,34 @@ from daph_exfusion.merge_toolkit import (
 
 
 class SimpleAttention(nn.Module):
-    """Clean attention block with independent Q/K/V/O projections."""
-    def __init__(self, hidden_size: int, num_heads: int = 4):
+    """Attention block with Grouped-Query Attention (GQA) support.
+
+    When ``num_kv_heads < num_heads``, K/V projections produce fewer heads
+    and are broadcast (repeat-interleaved) to match the query head count.
+    This matches the architecture of LLaMA-3, Mistral, Qwen-2, etc.
+    """
+    def __init__(self, hidden_size: int, num_heads: int = 4,
+                 num_kv_heads: Optional[int] = None):
         super().__init__()
         assert hidden_size % num_heads == 0
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = hidden_size // num_heads
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, x, mask=None):
         B, L, D = x.shape
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Broadcast K/V for GQA/MQA (num_kv_heads < num_heads)
+        if self.num_kv_heads < self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask
@@ -49,16 +62,17 @@ class SimpleAttention(nn.Module):
 
 class PyTAttentionPath(nn.Module):
     """Wrapper matching MLX namespace layout exactly."""
-    def __init__(self, hidden_size: int, num_heads: int = 4):
+    def __init__(self, hidden_size: int, num_heads: int = 4,
+                 num_kv_heads: Optional[int] = None):
         super().__init__()
         self.norm = nn.LayerNorm(hidden_size)
-        self.attn = SimpleAttention(hidden_size, num_heads)
+        self.attn = SimpleAttention(hidden_size, num_heads, num_kv_heads=num_kv_heads)
 
     def forward(self, x, mask=None):
         return self.attn(self.norm(x), mask)
 
 
-def make_mamba_factory(hidden_size: int, d_conv: int = 4):
+def make_mamba_factory(hidden_size: int, d_conv: int = 4, d_state: int = 16):
     def factory():
         class SimpleMambaBlock(nn.Module):
             def __init__(self):
@@ -70,7 +84,9 @@ def make_mamba_factory(hidden_size: int, d_conv: int = 4):
                     hidden_size, hidden_size, kernel_size=d_conv,
                     stride=1, padding=0, groups=hidden_size, bias=True,
                 )
-                self.x_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+                # Project to d_state (e.g. 16), not d_model — matches Mamba-1
+                self.x_proj_B = nn.Linear(hidden_size, d_state, bias=False)
+                self.x_proj_C = nn.Linear(hidden_size, d_state, bias=False)
                 self.dt_proj = nn.Linear(hidden_size, hidden_size, bias=False)
                 self.A_log = nn.Parameter(torch.zeros(hidden_size))
                 self.D = nn.Parameter(torch.zeros(hidden_size))
@@ -78,12 +94,12 @@ def make_mamba_factory(hidden_size: int, d_conv: int = 4):
             def forward(self, x):
                 h = self.in_proj(x)
                 a_gate, b_gate = h[..., :hidden_size], h[..., hidden_size:]
-                u = torch.silu(a_gate) * b_gate  # (B, L, D)
+                u = F.silu(a_gate) * b_gate  # (B, L, D)
                 # Causal depthwise conv1d: left-pad, conv, SiLU
                 pad = torch.zeros(x.shape[0], d_conv - 1, hidden_size,
                                   device=x.device, dtype=x.dtype)
                 u_padded = torch.cat([pad, u], dim=1).transpose(1, 2)  # (B, D, L+k-1)
-                u = torch.silu(self.conv1d(u_padded).transpose(1, 2))  # (B, L, D)
+                u = F.silu(self.conv1d(u_padded).transpose(1, 2))  # (B, L, D)
                 delta = F.softplus(self.dt_proj(u))
                 y = u + self.D * u
                 return self.out_proj(y)

@@ -140,10 +140,12 @@ class DAPHDecoderLayerV2(nn.Module):
         attention_factory: Optional[callable] = None,
         macro_router_kwargs: Optional[dict] = None,
         use_cheap_path: bool = True,
+        use_packed_dispatch: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.use_cheap_path = use_cheap_path
+        self.use_packed_dispatch = use_packed_dispatch
 
         self.attn_path = attention_factory() if attention_factory is not None else None
         self.ffn_path = ffn_exfusion_factory() if ffn_exfusion_factory is not None else None
@@ -186,7 +188,9 @@ class DAPHDecoderLayerV2(nn.Module):
         if hasattr(self, '_fft_cache') and self._fft_cache.get('key') == cache_key:
             x_fft = self._fft_cache['value']
         else:
-            x_fft = torch.fft.fft2(x, dim=(-2, -1)).real
+            # Upcast to float32 before FFT — torch.fft does not support
+            # half-precision (float16/bfloat16) on many GPU and CPU platforms.
+            x_fft = torch.fft.fft2(x.float(), dim=(-2, -1)).real.to(x.dtype)
             self._fft_cache = {'key': cache_key, 'value': x_fft}
         return self.cheap_proj(x_fft)
 
@@ -276,7 +280,7 @@ class DAPHDecoderLayerV2(nn.Module):
                 # Use packed dispatch for FFN when merged (inference mode).
                 # During training (not merged), the FFN's internal expert
                 # routing needs the full batch for statistics.
-                if hasattr(self.ffn_path, 'is_merged') and self.ffn_path.is_merged:
+                if hasattr(self.ffn_path, 'is_merged') and self.ffn_path.is_merged and self.use_packed_dispatch:
                     eff_out += self._packed_dispatch(
                         hidden, self.ffn_path, mask[:, :, 1]
                     )

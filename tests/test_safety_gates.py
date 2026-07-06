@@ -268,11 +268,11 @@ def test_mamba_selective_scan_returns_state():
     import numpy as np
     from daph_exfusion.mlx_inference import mamba_selective_scan
 
-    B, L, D = 2, 8, 16
+    B, L, D, d_state = 2, 8, 16, 16
     delta = mx.random.normal((B, L, D))
     A_log = mx.random.normal((D,))
-    Bv = mx.random.normal((B, L, D))
-    C = mx.random.normal((B, L, D))
+    Bv = mx.random.normal((B, L, d_state))
+    C = mx.random.normal((B, L, d_state))
     Dv = mx.random.normal((D,))
     x = mx.random.normal((B, L, D))
 
@@ -282,7 +282,9 @@ def test_mamba_selective_scan_returns_state():
     )
     y, h_last = result
     assert y.shape == (B, L, D), f"y shape {y.shape}, expected {(B, L, D)}"
-    assert h_last.shape == (B, D), f"h_last shape {h_last.shape}, expected {(B, D)}"
+    assert h_last.shape == (B, D, d_state), (
+        f"h_last shape {h_last.shape}, expected {(B, D, d_state)}"
+    )
 
 
 # ---------------------------------------------------------------------------

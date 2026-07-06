@@ -472,8 +472,13 @@ class KFACFisherTracker:
             elif self.config.score_mode == "log_trace":
                 score = torch.log1p(tr_a) * torch.log1p(tr_g)
             elif self.config.score_mode == "fro":
-                # ||U @ diag(s) @ U^T||_F = ||s|| (since U is orthonormal)
-                score = s_a_damped.norm() * s_g_damped.norm()
+                # Correct Frobenius norm of U @ diag(s) @ U^T + d * I:
+                # ||A||_F^2 = sum(s_i^2) + d^2 * (D - k)
+                # s_a_damped = s_a + d, so sum(s_a_damped^2) = sum((s_a+d)^2)
+                # The inactive (D-k) dimensions contribute d^2 each.
+                norm_a_sq = s_a_damped.pow(2).sum() + (d ** 2) * (dim_a - k_a)
+                norm_g_sq = s_g_damped.pow(2).sum() + (d ** 2) * (dim_g - k_g)
+                score = norm_a_sq.sqrt() * norm_g_sq.sqrt()
             elif self.config.score_mode == "spectral_proxy":
                 # Max eigenvalue is max(s) for the factored form
                 score = s_a_damped.max().clamp_min(0) * s_g_damped.max().clamp_min(0)
