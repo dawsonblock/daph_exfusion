@@ -52,7 +52,9 @@ _cooperative_kernel_cache: dict[int, object] = {}
 _COOPERATIVE_D_STATE_THRESHOLD = 128
 
 # SIMD group width for cooperative state reduction.
-_SIMD_WIDTH = 16
+# Must match the Apple GPU SIMD group width (32 threads) so that
+# simd_sum reduces within a single channel's thread group.
+_SIMD_WIDTH = 32
 
 def _get_mamba_scan_kernel(d_state: int):
     """Return a compiled single-thread Metal kernel for the given d_state.
@@ -134,7 +136,7 @@ def _get_cooperative_mamba_scan_kernel(d_state: int):
     Partial dot products are reduced via simd_sum, keeping per-thread
     register footprint small and constant regardless of d_state.
 
-    Supports d_state up to 4096 (W=16, S<=256 floats per thread).
+    Supports d_state up to 8192 (W=32, S<=256 floats per thread).
     """
     W = _SIMD_WIDTH
     S = (d_state + W - 1) // W  # ceil division
@@ -161,50 +163,61 @@ def _get_cooperative_mamba_scan_kernel(d_state: int):
         uint channel_idx = elem / {W};
         uint thread_idx_in_channel = elem % {W};
 
-        // Guard: padded threads beyond the needed channel count exit.
-        if (channel_idx >= total_channels) return;
+        // Determine if this thread is active (not padding).
+        // Do NOT return early — inactive threads must still participate
+        // in simd_sum with a zero contribution, otherwise the reduction
+        // produces undefined results for the last channel in a threadgroup.
+        bool active = (channel_idx < total_channels);
 
-        uint b_idx = channel_idx / d;
-        uint c_idx = channel_idx % d;
+        uint b_idx = active ? (channel_idx / d) : 0;
+        uint c_idx = active ? (channel_idx % d) : 0;
 
-        float a_f = -metal::exp((float)A_log[c_idx]);
+        float a_f = active ? -metal::exp((float)A_log[c_idx]) : 0.0f;
 
         // Each thread holds S state elements — small constant register footprint.
         float h_local[{S}];
         for (uint i = 0; i < {S}; i++) h_local[i] = 0.0f;
 
         for (uint t = 0; t < L; t++) {{
-            uint idx_x = (b_idx * L + t) * d + c_idx;
-            float dt_f = (float)delta[idx_x];
-            float xt_f = (float)x[idx_x];
-            float decay = metal::exp(dt_f * a_f);
-
-            // Compute local state recurrence and partial dot product.
+            // Compute local partial dot product (0 for inactive threads).
             float partial_dot = 0.0f;
-            for (uint i = 0; i < {S}; i++) {{
-                uint n = thread_idx_in_channel * {S} + i;
-                if (n >= d_state) break;  // Handle non-multiple d_state
-                uint idx_s = (b_idx * L + t) * d_state + n;
-                float Bt_f = (float)B[idx_s];
-                float Ct_f = (float)C[idx_s];
-                h_local[i] = decay * h_local[i] + dt_f * Bt_f * xt_f;
-                partial_dot += Ct_f * h_local[i];
+            float dt_f = 0.0f;
+            float xt_f = 0.0f;
+            uint idx_x = 0;
+            if (active) {{
+                idx_x = (b_idx * L + t) * d + c_idx;
+                dt_f = (float)delta[idx_x];
+                xt_f = (float)x[idx_x];
+                float decay = metal::exp(dt_f * a_f);
+
+                for (uint i = 0; i < {S}; i++) {{
+                    uint n = thread_idx_in_channel * {S} + i;
+                    if (n >= d_state) break;  // Handle non-multiple d_state
+                    uint idx_s = (b_idx * L + t) * d_state + n;
+                    float Bt_f = (float)B[idx_s];
+                    float Ct_f = (float)C[idx_s];
+                    h_local[i] = decay * h_local[i] + dt_f * Bt_f * xt_f;
+                    partial_dot += Ct_f * h_local[i];
+                }}
             }}
 
-            // SIMD-group reduction: sum partial dots across W threads.
+            // SIMD-group reduction: ALL threads (including inactive with 0)
+            // must call simd_sum at the same point — no divergence here.
             float final_dot = simd_sum(partial_dot);
 
-            // Only thread 0 writes the output (includes D * x term).
-            if (thread_idx_in_channel == 0) {{
+            // Only active thread 0 writes the output (includes D * x term).
+            if (active && thread_idx_in_channel == 0) {{
                 y[idx_x] = T(final_dot + (float)D[c_idx] * xt_f);
             }}
         }}
 
-        // Coalesced write-back of final state segments.
-        for (uint i = 0; i < {S}; i++) {{
-            uint n = thread_idx_in_channel * {S} + i;
-            if (n >= d_state) break;
-            h_last[(b_idx * d + c_idx) * d_state + n] = T(h_local[i]);
+        // Coalesced write-back of final state segments (active threads only).
+        if (active) {{
+            for (uint i = 0; i < {S}; i++) {{
+                uint n = thread_idx_in_channel * {S} + i;
+                if (n >= d_state) break;
+                h_last[(b_idx * d + c_idx) * d_state + n] = T(h_local[i]);
+            }}
         }}
     """
 

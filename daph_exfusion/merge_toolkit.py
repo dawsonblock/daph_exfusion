@@ -1708,8 +1708,8 @@ class MemoryBankExFusionFFN(nn.Module):
             # Supports multi-projection MLPs: up → SiLU → [mid0 → SiLU]* → down
             seq_modules = [merged_layers["up"], nn.SiLU()]
             mid_keys = sorted(
-                k for k in merged_layers
-                if k.startswith("mid")
+                (k for k in merged_layers if k.startswith("mid")),
+                key=lambda k: int(k.split("mid")[1].split(".")[0])
             )
             for mk in mid_keys:
                 seq_modules.append(merged_layers[mk])

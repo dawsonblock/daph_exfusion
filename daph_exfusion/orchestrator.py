@@ -175,20 +175,12 @@ class AutomatedMergePipeline:
             "seed": 42,
         }
 
-        # Include Mamba in the calibration loop if available
+        # Include Mamba in a separate merge step if available.
+        # unified_calibration_loop applies the same merge_kwargs_common to
+        # all modules, so we cannot mix FFN and Mamba (they need different
+        # Fisher diagonals).  Instead, calibrate FFN first, then manually
+        # merge Mamba with its own kwargs.
         exfusion_modules = [self.layer.ffn_path]
-        if mamba_fisher_diagonals is not None and mamba_expert_scores is not None:
-            mamba_merge_kwargs = {
-                "pipeline": ["dare", "ties", "fisher", "kfac"],
-                "fisher_diagonals": mamba_fisher_diagonals,
-                "kfac_scores": mamba_expert_scores,
-                "kfac_temperature": 1.0,
-                "seed": 42,
-            }
-            # unified_calibration_loop uses the same common kwargs for all
-            # modules; we pass Mamba as a second module with its own kwargs
-            # by extending the search to cover both paths.
-            exfusion_modules.append(self.layer.mamba_path)
 
         winning_hyperparameters = unified_calibration_loop(
             exfusion_modules=exfusion_modules,
@@ -198,6 +190,19 @@ class AutomatedMergePipeline:
             rounds=2,
             verbose=True,
         )
+
+        # Manually merge Mamba with its own Fisher diagonals and the
+        # winning hyperparameters from the FFN calibration.
+        if mamba_fisher_diagonals is not None and mamba_expert_scores is not None:
+            mamba_merge_kwargs = {
+                "pipeline": ["dare", "ties", "fisher", "kfac"],
+                "fisher_diagonals": mamba_fisher_diagonals,
+                "kfac_scores": mamba_expert_scores,
+                "kfac_temperature": 1.0,
+                "seed": 42,
+                **winning_hyperparameters,
+            }
+            self.layer.mamba_path.merge_to_dense(**mamba_merge_kwargs)
 
         # 5. Attempt to export the merged layer to MLX (if available)
         mlx_status = self._export_to_mlx()
