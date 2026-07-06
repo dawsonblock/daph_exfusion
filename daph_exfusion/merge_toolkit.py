@@ -273,8 +273,16 @@ class RunningCovariance:
                     self.U * scale_old,                  # (D, k)
                     Q_resid @ (R_resid * scale_new),     # (D, S)
                 ], dim=1)  # (D, k + S)
-                # SVD of B to get new top-k
-                U_new, s_new, _ = torch.linalg.svd(B, full_matrices=False)
+                # SVD of B to get new top-k.  Wrap in a fallback to handle
+                # ill-conditioned matrices (e.g. null calibration batches)
+                # that can cause torch.linalg.svd to fail convergence.
+                try:
+                    U_new, s_new, _ = torch.linalg.svd(B, full_matrices=False)
+                except torch.linalg.LinAlgError:
+                    # Add a tiny numerical perturbation (jitter) to break
+                    # degeneracy and prevent convergence failures.
+                    B_jitter = B + 1e-6 * torch.randn_like(B)
+                    U_new, s_new, _ = torch.linalg.svd(B_jitter, full_matrices=False)
                 self.U = U_new[:, :k]
                 self.s = s_new[:k] ** 2  # eigenvalues of covariance
         elif self.mode == "diagonal":

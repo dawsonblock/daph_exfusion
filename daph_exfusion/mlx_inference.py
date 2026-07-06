@@ -105,7 +105,19 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     Returns ``(y, h_last)`` where ``y`` has shape ``(B, L, D)`` and ``h_last``
     has shape ``(B, D, d_state)`` — the final recurrent state after processing
     the full sequence, captured in the same GPU pass with no Python loop.
+
+    .. note::
+        The Metal kernel allocates a static register array of size 16 for the
+        SSM state.  Calling with ``d_state > 16`` will raise ``ValueError``
+        to prevent out-of-bounds GPU memory writes.
     """
+    d_state = B.shape[2]
+    if d_state > 16:
+        raise ValueError(
+            f"The fused selective scan Metal kernel is optimized for register "
+            f"execution and supports d_state <= 16. Got d_state = {d_state}. "
+            f"Use a smaller state dimension or fall back to the Python reference."
+        )
     dtype = x.dtype
     delta = delta.astype(dtype)
     A_log = A_log.astype(dtype)
@@ -113,7 +125,6 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
     C = C.astype(dtype)
     D = D.astype(dtype)
 
-    d_state = B.shape[2]
     y_shape = x.shape
     h_last_shape = (x.shape[0], x.shape[2], d_state)  # (B, D, d_state)
 

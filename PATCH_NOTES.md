@@ -1,5 +1,40 @@
 # Patch Notes
 
+## v4.3.6 — Runtime Safety Guards (2026-07-05)
+
+Two defensive guards to ensure absolute runtime safety in production
+environments.
+
+### 1. Metal Shader Array Boundary Guard (d_state > 16)
+
+The `_mamba_scan_kernel` Metal shader allocates a static register array
+of size 16 (`float h_states[16]`) for peak GPU register execution speed.
+If a user loads a custom Mamba configuration with `d_state > 16` (e.g.
+32 or 64 for increased memory capacity), the inner loop would write
+out of bounds, causing undefined GPU memory writes, inference corruption,
+GPU execution hangs, or kernel panics.
+
+Fix: `mamba_selective_scan` now validates `d_state` before dispatching
+to the Metal kernel and raises a clean `ValueError` if `d_state > 16`,
+directing the user to fall back to the Python reference path.
+
+### 2. K-FAC SVD Convergence Fallback
+
+In `RunningCovariance.update()` under the `low_rank=True` path,
+`torch.linalg.svd` can fail to converge on heavily ill-conditioned
+matrices (e.g. null calibration batches where most activations are
+exact zeros), raising a `LinAlgError` that crashes the tracking pipeline.
+
+Fix: the SVD call is now wrapped in a try/except. On `LinAlgError`, a
+tiny numerical perturbation (`1e-6 * randn`) is added to break
+degeneracy before retrying, guaranteeing tracking continuity.
+
+### Test results
+
+- **61 passed, 0 failed** — full green suite maintained.
+
+---
+
 ## v4.3.5 — Real-World Model Compatibility (2026-07-05)
 
 Five structural fixes enabling compatibility with real-world large-scale
