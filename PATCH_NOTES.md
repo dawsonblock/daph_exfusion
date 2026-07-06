@@ -1,5 +1,91 @@
 # Patch Notes
 
+## v4.2.1 — Remediation Patch (2026-07-05)
+
+Four defects called out in the v4.2 review are fixed in this patch. Each fix
+is pinned by a regression test in `tests/test_safety_gates.py` so a future
+regression breaks the build immediately.
+
+### 1. Mamba sign-election now uses `majority` everywhere
+
+`DEFAULT_MAMBA_POLICIES` previously set `sign_mode="magnitude_weighted"` for
+`in_proj`, `out_proj`, `x_proj`, and `dt_proj`. Under `magnitude_weighted`,
+`sign · |Δ|` collapses to the raw delta, so large-magnitude outliers swamp
+the election and the "vote" is meaningless. All six groups now default to
+`sign_mode="majority"` (the mathematically correct interpretation of a sign
+election). Researchers may still override to `"magnitude_weighted"` for
+ablations, but the shipped default is `majority`.
+
+- Regression: `test_default_mamba_policies_use_majority_sign_election`
+
+### 2. MLX pre-fill loop uses a compiled per-step kernel
+
+The stateful decoder's pre-fill path built L eager graph nodes per timestep
+(`exp`, `mul`, `mul`, `mul`, `add`), so CPU→GPU graph build dominated latency
+for L≥1k. The per-step update is now wrapped in `@mx.compile` as
+`_ssm_prefill_step`, fusing the elementwise chain into a single compiled
+kernel call per timestep. The Python loop remains (the sequential SSM scan
+has a data dependency across timesteps) but each iteration is one compiled
+node instead of ~5 eager ops. The pure-Python reference loop
+(`mamba_selective_scan_reference`) is preserved for correctness checks.
+
+- New exports: `_ssm_prefill_step`, `ssm_prefill_loop`
+- Regression: `test_compiled_prefill_matches_reference` (compiled vs.
+  reference final state within 1e-6)
+
+### 3. K-FAC tracker defaults to diagonal-only factors
+
+`RunningCovariance` previously allocated a full `(dim, dim)` covariance per
+factor — ~1.6 GB per layer per expert at `d_model=4096`, unusable on any
+consumer GPU. `KFACConfig.diagonal_only` (default `True`) now makes each
+factor store only the diagonal: a 1D tensor of length `dim` (a few MB). The
+forward/backward hooks compute `(x * x).sum(0)` directly instead of
+`x.t() @ x`, so the large transient covariance is also avoided. All
+consumers (`get_factors`, `layer_score`, `weight_diag_proxy`) handle both
+1D (diagonal) and 2D (full) factors, so setting `diagonal_only=False` still
+works for ablations.
+
+- Regression: `test_kfac_diagonal_only_tracker_is_1d`,
+  `test_kfac_full_covariance_still_supported`
+
+### 4. PT→MLX bridge fails loudly on missing keys
+
+`validate_architecture_compatibility` previously `continue`d past any PT
+key with no MLX counterpart, so a single missing projection weight produced
+nonsense inference but went unnoticed. It now detects missing keys in both
+directions (`missing_in_mlx`, `missing_in_pt`) and raises `RuntimeError`
+under `raise_on_mismatch=True` (the default in `load_mlx_model` with
+`strict=True`), or emits a warning and returns `False` when lenient. Also
+fixed: the bridge used `Module.iter_flat_views()`, which does not exist in
+MLX 0.31; it now uses `mlx.utils.tree_flatten` to enumerate parameters.
+
+- Regression: `test_bridge_raises_on_missing_keys`,
+  `test_validate_raises_on_missing_keys`,
+  `test_validate_warns_on_missing_keys_when_lenient`
+
+### Other
+
+- Fixed a pre-existing `SyntaxError` in `tests/test_import.py` (unterminated
+  multi-line f-string) that blocked the whole suite from collecting.
+- Bumped version to `2026.07.4.2.1` in `__init__.py` and `pyproject.toml`.
+
+### Known pre-existing failures (not addressed in this patch)
+
+The following test failures exist on MLX 0.31 / the current environment and
+are unrelated to the four fixes above; they are tracked separately:
+
+- `test_adaptive_router.py`, `test_mlx_adaptive_router.py`: `mx.clip` was
+  called with `min_val`/`max_val` kwargs; MLX 0.31 requires positional
+  `a_min`/`a_max`.
+- `test_benchmark.py`: shape mismatch in benchmark fixtures.
+- `test_bridge.py::test_map_key_*`: `clean_pytorch_keys` key-mapping does
+  not match the test expectations.
+- `test_merge_toolkit.py::test_mamba_seed_determinism`: the test does not
+  seed expert weight initialization, so two `make_block()` calls produce
+  different experts.
+
+---
+
 ## 1. `merge_toolkit.py`: K-FAC Expert Aggregation
 
 Add or import:
