@@ -47,13 +47,70 @@ def fused_swiglu_epilogue(gate_out: mx.array, up_out: mx.array) -> mx.array:
 _mamba_kernel_cache: dict[int, object] = {}
 _cooperative_kernel_cache: dict[int, object] = {}
 
+# Cache for threadgroup sizes parallel to _cooperative_kernel_cache
+_cooperative_tg_size_cache: dict = {}
+
 # Threshold above which we switch to the cooperative (multi-thread) kernel.
 # Below this, the single-thread-per-channel kernel is faster (no sync overhead).
 _COOPERATIVE_D_STATE_THRESHOLD = 128
 
-# SIMD group width for cooperative state reduction.
-# Must match the Apple GPU SIMD group width (32 threads) so that
-# simd_sum reduces within a single channel's thread group.
+# v4.8.0: Runtime SIMD-width probe for cooperative kernel portability.
+# Defaults to 32 (Apple GPU standard).  Probed at runtime via a Metal
+# kernel that reads the hardware's threads_per_simdgroup built-in.
+_PROBED_SIMD_WIDTH: Optional[int] = None
+
+# Probe kernel: reads the GPU's native SIMD group width.
+# Uses a dummy input because MLX's metal_kernel requires at least one input.
+_simd_probe_kernel = mx.fast.metal_kernel(
+    name="simd_probe",
+    input_names=["dummy"],
+    output_names=["width"],
+    source="""
+        uint elem = thread_position_in_grid.x;
+        if (elem == 0) {
+            width[0] = T(threads_per_simdgroup);
+        }
+    """,
+)
+
+
+def probe_hardware_simd_width() -> int:
+    """Query the GPU's native SIMD group width via a Metal probe kernel.
+
+    Executes a 1-thread probe that reads the ``threads_per_simdgroup``
+    built-in variable from the Metal Shading Language.  The result is
+    cached globally so the probe only runs once per process.
+
+    Returns:
+        The hardware SIMD group width (32 on Apple Silicon, potentially
+        64 on other Metal implementations).  Falls back to 32 if the
+        probe fails (e.g. on non-Metal backends).
+    """
+    global _PROBED_SIMD_WIDTH
+    if _PROBED_SIMD_WIDTH is not None:
+        return _PROBED_SIMD_WIDTH
+
+    try:
+        dummy = mx.zeros((1,), dtype=mx.float32)
+        out = _simd_probe_kernel(
+            inputs=[dummy],
+            template=[("T", mx.float32)],
+            grid=(32, 1, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(1,)],
+            output_dtypes=[mx.float32],
+        )
+        mx.eval(out)
+        _PROBED_SIMD_WIDTH = int(out[0])
+    except Exception:
+        # Fallback to standard Apple GPU SIMD width of 32
+        _PROBED_SIMD_WIDTH = 32
+
+    return _PROBED_SIMD_WIDTH
+
+
+# Backward-compatible constant — still 32, but cooperative code should
+# call probe_hardware_simd_width() for portability.
 _SIMD_WIDTH = 32
 
 def _get_mamba_scan_kernel(d_state: int):
@@ -132,16 +189,21 @@ def _compute_cooperative_tiling(d_state: int) -> tuple:
     """Compute dynamic tiling parameters for the cooperative kernel.
 
     Returns (W, S, channels_per_tg, tg_size) where:
-      - W: SIMD group width (32)
+      - W: SIMD group width (probed from hardware, default 32)
       - S: state elements per thread = ceil(d_state / W)
       - channels_per_tg: channels per threadgroup, dynamically scaled
-        to cap L1 shared memory at 16KB
+        to cap L1 shared memory at 32KB
       - tg_size: threadgroup size = channels_per_tg * W
 
-    The 16KB cap ensures the shared memory allocation fits within the
+    v4.8.0: W is now probed at runtime via ``probe_hardware_simd_width()``
+    instead of being hardcoded to 32.  This ensures correct simd_sum
+    alignment on any Metal implementation (Apple GPU = 32, potential
+    future AMD/Metal = 64).
+
+    The 32KB cap ensures the shared memory allocation fits within the
     L1 cache of Apple Silicon GPU cores for any d_state up to 8192.
     """
-    W = _SIMD_WIDTH
+    W = probe_hardware_simd_width()
     S = (d_state + W - 1) // W
 
     if S > 256:
@@ -359,9 +421,9 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
         )
     else:
         # Cooperative kernel: W threads per channel, SIMD-group reduction.
-        # v4.7.0: Use dynamic threadgroup size from the tiling computation.
+        # v4.8.0: Use probed SIMD width and dynamic threadgroup size.
         kernel = _get_cooperative_mamba_scan_kernel(d_state)
-        W = _SIMD_WIDTH
+        W = probe_hardware_simd_width()
         tg_size = _cooperative_tg_size_cache.get(d_state, 256)
         y, h_last = kernel(
             inputs=[delta, A_log, B, C, D, x],

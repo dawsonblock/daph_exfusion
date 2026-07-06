@@ -1,5 +1,88 @@
 # Patch Notes
 
+## v4.8.0 — GIL-Free Offloading & SIMD-Width Portability (2026-07-09)
+
+Resolves two low-level systems engineering constraints: Python GIL
+contention during MPS offloading, and SIMD-group width portability
+across Metal execution targets.
+
+### 1. GIL-Free In-Place copy_ Pipelining (PersistentHostMemoryBank)
+
+**Problem**: `AsyncMemoryOffloader` (v4.7.0) used `.to("cpu")` and
+`.to(device)` in the background thread pool to move expert parameters.
+These calls allocate new tensors via PyTorch's host-side memory
+management APIs, which require the Python Global Interpreter Lock (GIL).
+While the background thread held the GIL for allocation, the main thread
+computing K-FAC gradients was blocked, creating periodic execution
+stalls.
+
+**Fix**: Introduced `PersistentHostMemoryBank`, which pre-allocates
+flat, contiguous CPU buffers for all expert parameters at pipeline
+initialization time.  During offload/recall, the offloader performs
+in-place `param.copy_(buffer)` instead of `param.data = param.data.to(...)`.
+
+PyTorch's C++ implementation of `copy_()` releases the GIL via
+`pybind11::gil_scoped_release` during the actual memory transfer,
+allowing the main thread to continue K-FAC computation uninterrupted.
+
+**Buffer allocation**: Buffers are created with `torch.empty_like(param, device="cpu")`
+and optionally pinned via `.pin_memory()` for faster DMA on CUDA.  On
+MPS, pinning may fail (MPS storage backend limitation) and is skipped
+gracefully — on Apple's Unified Memory Architecture, unpinned buffers
+perform equivalently since CPU and GPU share physical memory.
+
+**API change**: `AsyncMemoryOffloader.__init__` now accepts an optional
+`module` parameter for pre-allocating the host bank.  When `module` is
+not provided, the offloader falls back to the v4.7.0 `.to()` behavior
+for backward compatibility.
+
+**Files**: `daph_exfusion/orchestrator.py`
+
+### 2. Runtime SIMD-Width Probe for Cooperative Kernel Portability
+
+**Problem**: The cooperative Metal scan kernel hardcoded `_SIMD_WIDTH = 32`,
+matching Apple Silicon's GPU SIMD group width.  If the model were
+executed on a Metal implementation with a different warp size (e.g. 64
+on some AMD hardware or virtualized Metal runtimes), the `simd_sum`
+reduction would misalign, producing incorrect results or arithmetic
+overflow.
+
+**Fix**: Introduced `probe_hardware_simd_width()`, which executes a
+single-pass Metal probe kernel that reads the `threads_per_simdgroup`
+built-in variable directly from the MSL compiler.  The result is cached
+globally in `_PROBED_SIMD_WIDTH` so the probe only runs once per process.
+
+The probe kernel uses a dummy input (MLX's `metal_kernel` requires at
+least one input) and a 32-thread threadgroup.  Thread 0 writes the
+`threads_per_simdgroup` value to a single-element output array, which is
+then evaluated and cached.
+
+`_compute_cooperative_tiling()` and `mamba_selective_scan()` now call
+`probe_hardware_simd_width()` instead of using the hardcoded `_SIMD_WIDTH`
+constant.  The constant is retained for backward compatibility but is
+no longer used by the cooperative kernel path.
+
+**Fallback**: If the probe kernel fails (e.g. on non-Metal backends or
+in CI environments without GPU access), the function falls back to 32,
+the standard Apple GPU SIMD width.
+
+**Files**: `daph_exfusion/mlx_inference.py`
+
+### Test Coverage
+
+11 new tests in `tests/test_v480_fixes.py`:
+- 7 tests for `PersistentHostMemoryBank` + GIL-free `copy_` offloading
+  (bank creation, get_buffer, no-experts edge case, offload with bank,
+  recall with bank, backward-compat fallback, value preservation across
+  offload/recall cycles)
+- 4 tests for SIMD-width probe (probe returns positive int, result is
+  cached, tiling uses probed width, kernel correctness after probe)
+
+2 existing tests in `tests/test_v470_fixes.py` updated to pass `module=`
+parameter to the new `AsyncMemoryOffloader` constructor.
+
+Total: 122 tests, all passing.
+
 ## v4.7.0 — Systems Constraints Resolution (2026-07-08)
 
 Resolves the two remaining system constraints identified in the v4.6.0

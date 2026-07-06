@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -38,41 +38,83 @@ def _get_transfer_pool() -> ThreadPoolExecutor:
     return _TRANSFER_POOL
 
 
+class PersistentHostMemoryBank:
+    """Pre-allocates flat CPU buffers for zero-allocation, GIL-free offloading.
+
+    Instead of allocating fresh tensors during offload/recall (which requires
+    the GIL for memory management), we pre-allocate CPU buffers at init time.
+    During transfers, ``param.copy_(buffer)`` is used, which releases the GIL
+    in PyTorch's C++ backend (``pybind11::gil_scoped_release``), allowing the
+    main thread to continue computation during the copy.
+
+    Buffers are optionally pinned for faster DMA transfers on CUDA.  On MPS,
+    pinning may not be available and is skipped gracefully.
+    """
+
+    def __init__(self, module: nn.Module):
+        self.buffers: Dict[str, torch.Tensor] = {}
+        if hasattr(module, "experts"):
+            for i, expert in enumerate(module.experts):
+                for name, param in expert.named_parameters():
+                    key = f"expert_{i}.{name}"
+                    cpu_tensor = torch.empty_like(
+                        param.data, device="cpu"
+                    )
+                    # Try to pin for faster DMA; skip if unsupported
+                    try:
+                        cpu_tensor = cpu_tensor.pin_memory()
+                    except RuntimeError:
+                        pass  # MPS or unsupported — unpinned is fine on UMA
+                    self.buffers[key] = cpu_tensor
+
+    def get_buffer(self, expert_idx: int, param_name: str) -> torch.Tensor:
+        return self.buffers[f"expert_{expert_idx}.{param_name}"]
+
+
 class AsyncMemoryOffloader:
-    """Device-agnostic asynchronous parameter pre-fetcher.
+    """GIL-free asynchronous parameter offloader using persistent buffers.
 
-    Uses CUDA streams on NVIDIA hardware for overlapped non-blocking
-    transfers.  On Apple Silicon (MPS) and CPU, where no stream API is
-    available, falls back to a background Python thread pool to prevent
-    CPU stalls during parameter offloading/recall.
+    v4.8.0: Uses ``PersistentHostMemoryBank`` to pre-allocate CPU buffers,
+    then performs in-place ``copy_()`` transfers which release the GIL in
+    PyTorch's C++ backend.  This eliminates GIL contention between the
+    background transfer thread and the main computation thread.
 
-    On UMA (Unified Memory Architecture) systems like Apple Silicon,
-    CPU and GPU share the same physical memory, so the actual copy
-    latency is lower than PCIe-based systems.  The thread pool still
-    helps by allowing the main thread to continue computation while
-    the parameter moves execute in the background.
+    On NVIDIA CUDA: uses ``torch.cuda.Stream`` + ``non_blocking=True`` for
+    overlapped DMA transfers with pinned memory.
+    On Apple Silicon (MPS) / CPU: uses a background ``ThreadPoolExecutor``
+    with ``copy_()`` (GIL-free) instead of ``.to()`` (GIL-holding).
 
     Args:
         device: Target compute device for recall operations.
-        use_async: If True, use async transfers (CUDA stream or thread
-            pool).  If False, all transfers are synchronous.
+        module: The ExFusion module to pre-allocate buffers for.
+        use_async: If True, use async transfers.  If False, synchronous.
     """
 
-    def __init__(self, device: torch.device, use_async: bool = True):
+    def __init__(self, device: torch.device, module: Optional[nn.Module] = None,
+                 use_async: bool = True):
         self.device = device
         self.use_async = use_async
         self.cuda_stream = None
         self.thread_future = None
+        self.host_bank = None
 
-        if use_async and device.type == "cuda":
-            self.cuda_stream = torch.cuda.Stream()
+        if use_async:
+            if module is not None:
+                self.host_bank = PersistentHostMemoryBank(module)
+            if device.type == "cuda":
+                self.cuda_stream = torch.cuda.Stream()
 
     def offload_async(self, module: nn.Module) -> None:
-        """Asynchronously push expert parameters to CPU memory."""
+        """Asynchronously copy parameters to persistent CPU buffers.
+
+        Uses ``copy_()`` which releases the GIL in C++, allowing the main
+        thread to continue computation during the transfer.
+        """
         if not hasattr(module, "experts"):
             return
 
-        if not self.use_async:
+        if not self.use_async or self.host_bank is None:
+            # Fallback: synchronous .to() (backward-compatible)
             for expert in module.experts:
                 for param in expert.parameters():
                     if param.device.type != "cpu":
@@ -80,32 +122,37 @@ class AsyncMemoryOffloader:
             return
 
         if self.cuda_stream is not None:
-            # NVIDIA pathway: asynchronous CUDA stream
-            for expert in module.experts:
-                for param in expert.parameters():
-                    if param.device.type != "cpu":
-                        if not param.data.is_pinned():
-                            param.data = param.data.pin_memory()
-                        with torch.cuda.stream(self.cuda_stream):
-                            param.data = param.data.to("cpu", non_blocking=True)
+            # NVIDIA CUDA pathway: stream + non_blocking copy_
+            for i, expert in enumerate(module.experts):
+                for name, param in expert.named_parameters():
+                    cpu_buf = self.host_bank.get_buffer(i, name)
+                    with torch.cuda.stream(self.cuda_stream):
+                        cpu_buf.copy_(param.data, non_blocking=True)
+                        param.data = cpu_buf
         else:
-            # Apple Silicon / CPU pathway: background thread pool
+            # Apple Silicon / CPU pathway: thread pool + GIL-free copy_
             def _thread_offload():
-                for expert in module.experts:
-                    for param in expert.parameters():
-                        if param.device.type != "cpu":
-                            param.data = param.data.to("cpu")
+                for i, expert in enumerate(module.experts):
+                    for name, param in expert.named_parameters():
+                        cpu_buf = self.host_bank.get_buffer(i, name)
+                        # copy_ releases GIL in C++ — main thread can run
+                        cpu_buf.copy_(param.data)
+                        param.data = cpu_buf
 
-            # Wait for previous transfer, then submit new job
             self.synchronize()
             self.thread_future = _get_transfer_pool().submit(_thread_offload)
 
     def recall_async(self, module: nn.Module) -> None:
-        """Asynchronously pull expert parameters to GPU memory."""
+        """Asynchronously pre-fetch parameters back to active GPU memory.
+
+        Allocates fresh GPU tensors and copies from the persistent CPU
+        buffers using ``copy_()`` (GIL-free).
+        """
         if not hasattr(module, "experts"):
             return
 
-        if not self.use_async:
+        if not self.use_async or self.host_bank is None:
+            # Fallback: synchronous .to()
             for expert in module.experts:
                 for param in expert.parameters():
                     if param.device.type != self.device.type:
@@ -113,19 +160,28 @@ class AsyncMemoryOffloader:
             return
 
         if self.cuda_stream is not None:
-            # NVIDIA pathway
-            for expert in module.experts:
-                for param in expert.parameters():
-                    if param.device.type == "cpu":
-                        with torch.cuda.stream(self.cuda_stream):
-                            param.data = param.data.to(self.device, non_blocking=True)
+            # NVIDIA CUDA pathway
+            for i, expert in enumerate(module.experts):
+                for name, param in expert.named_parameters():
+                    gpu_tensor = torch.empty_like(
+                        param.data, device=self.device
+                    )
+                    with torch.cuda.stream(self.cuda_stream):
+                        gpu_tensor.copy_(
+                            self.host_bank.get_buffer(i, name),
+                            non_blocking=True,
+                        )
+                        param.data = gpu_tensor
         else:
             # Apple Silicon / CPU pathway
             def _thread_recall():
-                for expert in module.experts:
-                    for param in expert.parameters():
-                        if param.device.type == "cpu":
-                            param.data = param.data.to(self.device)
+                for i, expert in enumerate(module.experts):
+                    for name, param in expert.named_parameters():
+                        gpu_tensor = torch.empty_like(
+                            param.data, device=self.device
+                        )
+                        gpu_tensor.copy_(self.host_bank.get_buffer(i, name))
+                        param.data = gpu_tensor
 
             self.synchronize()
             self.thread_future = _get_transfer_pool().submit(_thread_recall)
@@ -272,10 +328,11 @@ class AutomatedMergePipeline:
         wrapper = _CalibrationModelWrapper(self.layer)
         device = next(self.layer.parameters()).device
 
-        # v4.7.0: Device-agnostic async offloading via AsyncMemoryOffloader.
-        # Uses CUDA streams on NVIDIA, thread-pool pipelining on MPS/CPU.
+        # v4.8.0: GIL-free async offloading via AsyncMemoryOffloader with
+        # persistent host memory buffers.  Uses copy_() (GIL-free) instead
+        # of .to() (GIL-holding) for in-place transfers.
         offloader = AsyncMemoryOffloader(
-            device, use_async=self.enable_memory_offloading
+            device, module=self.layer, use_async=self.enable_memory_offloading
         )
 
         # Memory offloading: offload Mamba experts while computing FFN Fisher

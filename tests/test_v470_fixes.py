@@ -67,7 +67,10 @@ def test_async_offloader_thread_pool_offload():
             self.experts = nn.ModuleList([FakeExpert(), FakeExpert()])
 
     module = FakeExFusion()
-    offloader = AsyncMemoryOffloader(torch.device("cpu"), use_async=True)
+    # v4.8.0: pass module to pre-allocate persistent host buffers
+    offloader = AsyncMemoryOffloader(
+        torch.device("cpu"), module=module, use_async=True
+    )
 
     # Async offload — on CPU this is a no-op but should use thread pool
     offloader.offload_async(module)
@@ -98,7 +101,9 @@ def test_async_offloader_thread_pool_recall():
             self.experts = nn.ModuleList([FakeExpert(), FakeExpert()])
 
     module = FakeExFusion()
-    offloader = AsyncMemoryOffloader(torch.device("cpu"), use_async=True)
+    offloader = AsyncMemoryOffloader(
+        torch.device("cpu"), module=module, use_async=True
+    )
 
     offloader.recall_async(module)
     assert offloader.thread_future is not None
@@ -147,7 +152,9 @@ def test_async_offloader_chained_operations():
             self.experts = nn.ModuleList([FakeExpert(), FakeExpert()])
 
     module = FakeExFusion()
-    offloader = AsyncMemoryOffloader(torch.device("cpu"), use_async=True)
+    offloader = AsyncMemoryOffloader(
+        torch.device("cpu"), module=module, use_async=True
+    )
 
     # Chain: offload → sync → recall → sync
     offloader.offload_async(module)
