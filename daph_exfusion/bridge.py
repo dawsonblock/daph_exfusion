@@ -63,12 +63,17 @@ def validate_architecture_compatibility(state_dict: dict, mlx_model: nn.Module, 
         pt_shape = tuple(tensor.shape)
         mlx_shape = tuple(mlx_parameters[key].shape)
 
-        # Address transpose configuration mismatch patterns between PyTorch and MLX linear elements
+        # Address transpose configuration mismatch patterns between PyTorch and MLX
         if "weight" in key and pt_shape != mlx_shape:
-            # Linear weights inside MLX are organized (out_features, in_features) matching PT,
-            # but transpose patterns can emerge depending on projection factories.
-            if pt_shape == (mlx_shape[1], mlx_shape[0]):
+            # Linear weights: (out, in) vs (in, out) — 2D transpose
+            if len(pt_shape) == 2 and pt_shape == (mlx_shape[1], mlx_shape[0]):
                 cleaned_state[key] = tensor.t()
+                pt_shape = tuple(cleaned_state[key].shape)
+            # Conv1d weights: PyTorch (out_ch, in_ch/groups, kernel) vs
+            # MLX (out_ch, kernel, in_ch/groups) — swap axes 1 and 2
+            elif (len(pt_shape) == 3 and pt_shape[0] == mlx_shape[0]
+                  and pt_shape[1] == mlx_shape[2] and pt_shape[2] == mlx_shape[1]):
+                cleaned_state[key] = tensor.permute(0, 2, 1).contiguous()
                 pt_shape = tuple(cleaned_state[key].shape)
 
         if pt_shape != mlx_shape:
