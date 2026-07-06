@@ -8,7 +8,8 @@ It expects the real DAPH ExFusion package to provide the merge toolkit classes.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -22,13 +23,128 @@ from daph_exfusion.merge_toolkit import (
 from daph_exfusion.upgrade_utils import aggregate_kfac_scores_to_experts
 
 
-def _get_transfer_stream() -> Optional[Any]:
-    """Return a background stream for async transfers, or None if unavailable.
+# Global thread pool for asynchronous host-device memory transfers on MPS/CPU.
+# Single worker ensures transfers are serialized and don't contend with each
+# other; the pool is reused across pipeline instances to avoid thread creation
+# overhead.  Created lazily to avoid spawning threads at import time.
+_TRANSFER_POOL: Optional[ThreadPoolExecutor] = None
 
-    CUDA has proper stream support.  MPS (Apple Silicon) does not expose
-    a stream API in PyTorch, so we fall back to non_blocking transfers
-    without a dedicated stream.
+
+def _get_transfer_pool() -> ThreadPoolExecutor:
+    """Return the global transfer thread pool, creating it on first use."""
+    global _TRANSFER_POOL
+    if _TRANSFER_POOL is None:
+        _TRANSFER_POOL = ThreadPoolExecutor(max_workers=1)
+    return _TRANSFER_POOL
+
+
+class AsyncMemoryOffloader:
+    """Device-agnostic asynchronous parameter pre-fetcher.
+
+    Uses CUDA streams on NVIDIA hardware for overlapped non-blocking
+    transfers.  On Apple Silicon (MPS) and CPU, where no stream API is
+    available, falls back to a background Python thread pool to prevent
+    CPU stalls during parameter offloading/recall.
+
+    On UMA (Unified Memory Architecture) systems like Apple Silicon,
+    CPU and GPU share the same physical memory, so the actual copy
+    latency is lower than PCIe-based systems.  The thread pool still
+    helps by allowing the main thread to continue computation while
+    the parameter moves execute in the background.
+
+    Args:
+        device: Target compute device for recall operations.
+        use_async: If True, use async transfers (CUDA stream or thread
+            pool).  If False, all transfers are synchronous.
     """
+
+    def __init__(self, device: torch.device, use_async: bool = True):
+        self.device = device
+        self.use_async = use_async
+        self.cuda_stream = None
+        self.thread_future = None
+
+        if use_async and device.type == "cuda":
+            self.cuda_stream = torch.cuda.Stream()
+
+    def offload_async(self, module: nn.Module) -> None:
+        """Asynchronously push expert parameters to CPU memory."""
+        if not hasattr(module, "experts"):
+            return
+
+        if not self.use_async:
+            for expert in module.experts:
+                for param in expert.parameters():
+                    if param.device.type != "cpu":
+                        param.data = param.data.to("cpu")
+            return
+
+        if self.cuda_stream is not None:
+            # NVIDIA pathway: asynchronous CUDA stream
+            for expert in module.experts:
+                for param in expert.parameters():
+                    if param.device.type != "cpu":
+                        if not param.data.is_pinned():
+                            param.data = param.data.pin_memory()
+                        with torch.cuda.stream(self.cuda_stream):
+                            param.data = param.data.to("cpu", non_blocking=True)
+        else:
+            # Apple Silicon / CPU pathway: background thread pool
+            def _thread_offload():
+                for expert in module.experts:
+                    for param in expert.parameters():
+                        if param.device.type != "cpu":
+                            param.data = param.data.to("cpu")
+
+            # Wait for previous transfer, then submit new job
+            self.synchronize()
+            self.thread_future = _get_transfer_pool().submit(_thread_offload)
+
+    def recall_async(self, module: nn.Module) -> None:
+        """Asynchronously pull expert parameters to GPU memory."""
+        if not hasattr(module, "experts"):
+            return
+
+        if not self.use_async:
+            for expert in module.experts:
+                for param in expert.parameters():
+                    if param.device.type != self.device.type:
+                        param.data = param.data.to(self.device)
+            return
+
+        if self.cuda_stream is not None:
+            # NVIDIA pathway
+            for expert in module.experts:
+                for param in expert.parameters():
+                    if param.device.type == "cpu":
+                        with torch.cuda.stream(self.cuda_stream):
+                            param.data = param.data.to(self.device, non_blocking=True)
+        else:
+            # Apple Silicon / CPU pathway
+            def _thread_recall():
+                for expert in module.experts:
+                    for param in expert.parameters():
+                        if param.device.type == "cpu":
+                            param.data = param.data.to(self.device)
+
+            self.synchronize()
+            self.thread_future = _get_transfer_pool().submit(_thread_recall)
+
+    def synchronize(self) -> None:
+        """Wait for any active background memory transfers to complete."""
+        if self.cuda_stream is not None:
+            torch.cuda.current_stream().wait_stream(self.cuda_stream)
+        elif self.thread_future is not None:
+            self.thread_future.result()
+            self.thread_future = None
+
+
+# ── Backward-compatible function wrappers ────────────────────────────────
+# These preserve the v4.6.0 API for callers that use the standalone
+# functions directly.  Internally they delegate to AsyncMemoryOffloader.
+
+def _get_transfer_stream() -> Optional[Any]:
+    """Return a CUDA stream for async transfers, or None if unavailable."""
     if torch.cuda.is_available():
         return torch.cuda.Stream()
     return None
@@ -46,13 +162,9 @@ def offload_experts_to_cpu(exfusion_module: nn.Module,
                            stream: Optional[Any] = None) -> None:
     """Offload all expert parameters in an ExFusion module to CPU memory.
 
-    This frees GPU VRAM during non-active stages of the merge pipeline,
-    allowing large expert configurations (e.g. 7B-scale models) to be
-    processed on consumer GPU hardware.
-
-    v4.6.0: When a CUDA stream is provided, transfers are non-blocking
-    and overlapped with computation on the main stream.  On MPS/CPU,
-    falls back to non_blocking=True without a dedicated stream.
+    Backward-compatible wrapper.  Prefer using ``AsyncMemoryOffloader``
+    directly for new code, as it supports thread-pool-based async
+    transfers on MPS/CPU.
     """
     if not hasattr(exfusion_module, "experts"):
         return
@@ -70,10 +182,8 @@ def recall_experts_to_gpu(exfusion_module: nn.Module, device: torch.device,
                           stream: Optional[Any] = None) -> None:
     """Move all expert parameters back to the target GPU device.
 
-    Called before calibration or tracking stages that require GPU execution.
-
-    v4.6.0: When a CUDA stream is provided, transfers are non-blocking
-    and overlapped with computation on the main stream.
+    Backward-compatible wrapper.  Prefer using ``AsyncMemoryOffloader``
+    directly for new code.
     """
     if not hasattr(exfusion_module, "experts"):
         return
@@ -162,15 +272,15 @@ class AutomatedMergePipeline:
         wrapper = _CalibrationModelWrapper(self.layer)
         device = next(self.layer.parameters()).device
 
-        # v4.6.0: Async stream-based memory offloading.
-        # When CUDA is available, use a background stream so transfers
-        # overlap with computation.  On MPS/CPU, falls back to
-        # non_blocking transfers without a dedicated stream.
-        transfer_stream = _get_transfer_stream() if self.enable_memory_offloading else None
+        # v4.7.0: Device-agnostic async offloading via AsyncMemoryOffloader.
+        # Uses CUDA streams on NVIDIA, thread-pool pipelining on MPS/CPU.
+        offloader = AsyncMemoryOffloader(
+            device, use_async=self.enable_memory_offloading
+        )
 
         # Memory offloading: offload Mamba experts while computing FFN Fisher
         if self.enable_memory_offloading and mamba_expert_scores is not None:
-            offload_experts_to_cpu(self.layer.mamba_path, stream=transfer_stream)
+            offloader.offload_async(self.layer.mamba_path)
 
         fisher_diagonals_ffn = build_fisher_diagonals(
             experts=self.layer.ffn_path.experts,
@@ -182,18 +292,16 @@ class AutomatedMergePipeline:
 
         # Recall Mamba experts and offload FFN experts for Mamba Fisher computation
         if self.enable_memory_offloading:
-            # Sync: ensure Mamba offload is complete before recalling
-            _sync_stream(transfer_stream)
+            offloader.synchronize()
             if mamba_expert_scores is not None:
-                recall_experts_to_gpu(self.layer.mamba_path, device, stream=transfer_stream)
-                offload_experts_to_cpu(self.layer.ffn_path, stream=transfer_stream)
+                offloader.recall_async(self.layer.mamba_path)
+                offloader.offload_async(self.layer.ffn_path)
 
         # Compute Mamba Fisher diagonals if the layer has a Mamba path
         mamba_fisher_diagonals = None
         if (hasattr(self.layer, "mamba_path") and self.layer.mamba_path is not None
                 and hasattr(self.layer.mamba_path, "experts")):
-            # Sync: ensure Mamba recall is complete before Fisher computation
-            _sync_stream(transfer_stream)
+            offloader.synchronize()
             mamba_fisher_diagonals = build_fisher_diagonals(
                 experts=self.layer.mamba_path.experts,
                 dataloader=self.loader,
@@ -204,9 +312,9 @@ class AutomatedMergePipeline:
 
         # Recall FFN experts back to GPU for calibration
         if self.enable_memory_offloading:
-            _sync_stream(transfer_stream)
-            recall_experts_to_gpu(self.layer.ffn_path, device, stream=transfer_stream)
-            _sync_stream(transfer_stream)
+            offloader.synchronize()
+            offloader.recall_async(self.layer.ffn_path)
+            offloader.synchronize()
 
         # 4. Launch coordinate-descent search for merge hyperparameters
         if search_space is None:

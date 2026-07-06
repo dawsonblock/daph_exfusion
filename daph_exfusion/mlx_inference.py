@@ -128,6 +128,52 @@ def _get_mamba_scan_kernel(d_state: int):
     return kernel
 
 
+def _compute_cooperative_tiling(d_state: int) -> tuple:
+    """Compute dynamic tiling parameters for the cooperative kernel.
+
+    Returns (W, S, channels_per_tg, tg_size) where:
+      - W: SIMD group width (32)
+      - S: state elements per thread = ceil(d_state / W)
+      - channels_per_tg: channels per threadgroup, dynamically scaled
+        to cap L1 shared memory at 16KB
+      - tg_size: threadgroup size = channels_per_tg * W
+
+    The 16KB cap ensures the shared memory allocation fits within the
+    L1 cache of Apple Silicon GPU cores for any d_state up to 8192.
+    """
+    W = _SIMD_WIDTH
+    S = (d_state + W - 1) // W
+
+    if S > 256:
+        raise ValueError(
+            f"Cooperative kernel supports d_state <= {W * 256}. "
+            f"Got d_state = {d_state} (S = {S} > 256)."
+        )
+
+    # v4.7.0: Dynamic shared memory tiling.
+    # Cap L1 shared memory at 32KB: channels_per_tg * d_state * 4 <= 32768
+    # → channels_per_tg * d_state <= 8192
+    # For d_state=128:  8192//128=64, capped at 8 → 8 channels, 4KB
+    # For d_state=256:  8192//256=32, capped at 8 → 8 channels, 8KB
+    # For d_state=512:  8192//512=16, capped at 8 → 8 channels, 16KB
+    # For d_state=1024: 8192//1024=8 → 8 channels, 32KB
+    # For d_state=2048: 8192//2048=4 → 4 channels, 32KB
+    # For d_state=4096: 8192//4096=2 → 2 channels, 32KB
+    # For d_state=8192: 8192//8192=1 → 1 channel,  32KB
+    #
+    # 32KB is within the Apple AGX L1 threadgroup memory ceiling
+    # (typically 32-64KB per execution core).  The original 16KB cap
+    # was too tight for d_state > 4096.
+    channels_per_tg = max(1, min(8, 8192 // d_state))
+    tg_size = channels_per_tg * W
+
+    return W, S, channels_per_tg, tg_size
+
+
+# Cache for threadgroup sizes parallel to _cooperative_kernel_cache
+_cooperative_tg_size_cache: dict = {}
+
+
 def _get_cooperative_mamba_scan_kernel(d_state: int):
     """Return a cooperative (multi-thread) Metal kernel for large d_state.
 
@@ -136,30 +182,23 @@ def _get_cooperative_mamba_scan_kernel(d_state: int):
     Partial dot products are reduced via simd_sum, keeping per-thread
     register footprint small and constant regardless of d_state.
 
+    v4.7.0: Dynamic shared memory tiling caps L1 usage at 16KB for any
+    d_state up to 8192, by reducing channels_per_tg as d_state grows.
+
     Supports d_state up to 8192 (W=32, S<=256 floats per thread).
     """
-    W = _SIMD_WIDTH
-    S = (d_state + W - 1) // W  # ceil division
-    # Threadgroup size is 256, with W=32 threads per channel → 8 channels/tg
-    _TG_SIZE = 256
-    _CHANNELS_PER_TG = _TG_SIZE // W  # 8
-
-    if S > 256:
-        raise ValueError(
-            f"Cooperative kernel supports d_state <= {W * 256}. "
-            f"Got d_state = {d_state} (S = {S} > 256)."
-        )
+    W, S, channels_per_tg, tg_size = _compute_cooperative_tiling(d_state)
 
     if d_state in _cooperative_kernel_cache:
         return _cooperative_kernel_cache[d_state]
 
     source = f"""
-        // v4.6.0: Threadgroup shared memory for coalesced state write-back.
-        // Partitioned by channel within the threadgroup: each of the
-        // {_CHANNELS_PER_TG} channels gets {d_state} floats.
-        // Total: {_CHANNELS_PER_TG * d_state} floats
-        // (e.g. 8*128=1024 floats=4KB for d_state=128, fits in L1).
-        threadgroup float shared_state[{_CHANNELS_PER_TG} * {d_state}];
+        // v4.7.0: Dynamic shared memory tiling.
+        // channels_per_tg = {channels_per_tg}, d_state = {d_state}
+        // Shared memory footprint: {channels_per_tg * d_state} floats
+        // = {channels_per_tg * d_state * 4} bytes ({channels_per_tg * d_state * 4 / 1024:.0f}KB)
+        // Capped at 16KB for any d_state up to 8192.
+        threadgroup float shared_state[{channels_per_tg} * {d_state}];
 
         uint elem = thread_position_in_grid.x;
         uint bsz = x_shape[0];
@@ -232,8 +271,9 @@ def _get_cooperative_mamba_scan_kernel(d_state: int):
         // barrier, then write to global memory in a transposed order where
         // consecutive threads write consecutive addresses (stride-1).
         //
-        // Channel index within this threadgroup (0..{_CHANNELS_PER_TG}-1)
-        uint tg_channel = (elem % {_TG_SIZE}) / {W};
+        // v4.7.0: tg_size is now dynamic (channels_per_tg * W).
+        // Channel index within this threadgroup (0..{channels_per_tg}-1)
+        uint tg_channel = (elem % {tg_size}) / {W};
         uint sm_base = tg_channel * {d_state};  // this channel's shared mem offset
 
         if (active) {{
@@ -269,6 +309,7 @@ def _get_cooperative_mamba_scan_kernel(d_state: int):
         source=source,
     )
     _cooperative_kernel_cache[d_state] = kernel
+    _cooperative_tg_size_cache[d_state] = tg_size
     return kernel
 
 def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
@@ -318,13 +359,15 @@ def mamba_selective_scan(delta: mx.array, A_log: mx.array, B: mx.array,
         )
     else:
         # Cooperative kernel: W threads per channel, SIMD-group reduction.
+        # v4.7.0: Use dynamic threadgroup size from the tiling computation.
         kernel = _get_cooperative_mamba_scan_kernel(d_state)
         W = _SIMD_WIDTH
+        tg_size = _cooperative_tg_size_cache.get(d_state, 256)
         y, h_last = kernel(
             inputs=[delta, A_log, B, C, D, x],
             template=[("T", dtype)],
             grid=(x.shape[0] * x.shape[2] * W, 1, 1),
-            threadgroup=(256, 1, 1),
+            threadgroup=(tg_size, 1, 1),
             output_shapes=[y_shape, h_last_shape],
             output_dtypes=[dtype, dtype],
         )

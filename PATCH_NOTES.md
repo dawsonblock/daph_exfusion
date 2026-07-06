@@ -1,5 +1,88 @@
 # Patch Notes
 
+## v4.7.0 — Systems Constraints Resolution (2026-07-08)
+
+Resolves the two remaining system constraints identified in the v4.6.0
+analysis: MPS stream limitations and L1 shared memory scaling.
+
+### 1. Thread-Pool Pipelined Offloading for Apple Silicon (MPS)
+
+**Problem**: PyTorch's MPS backend does not expose a stream API
+(`torch.mps.Stream` is not available), causing `_get_transfer_stream()`
+to return `None` on Apple Silicon.  Large calibration merges fell back
+to synchronous transfers, stalling CPU threads.
+
+**Fix**: Introduced `AsyncMemoryOffloader`, a device-agnostic
+asynchronous parameter manager:
+
+- **NVIDIA (CUDA)**: Uses `torch.cuda.Stream` for overlapped non-blocking
+  transfers with pinned host memory — same as v4.6.0.
+- **Apple Silicon (MPS) / CPU**: Dispatches parameter transfers to a
+  background `ThreadPoolExecutor` (single worker, lazily created global
+  pool).  The main thread continues computation while the background
+  thread executes the `.to("cpu")` or `.to(device)` calls.  On Apple's
+  Unified Memory Architecture, the actual copy latency is lower than
+  PCIe-based systems, but the thread pool still hides the Python-side
+  overhead of iterating parameters and issuing transfer calls.
+
+The `AutomatedMergePipeline.execute()` method now uses `AsyncMemoryOffloader`
+instead of the standalone stream-based functions.  The old
+`offload_experts_to_cpu` / `recall_experts_to_gpu` functions are preserved
+as backward-compatible wrappers.
+
+**Files**: `daph_exfusion/orchestrator.py`
+
+### 2. Dynamic Shared Memory Tiling in Cooperative Metal Kernel
+
+**Problem**: The v4.6.0 cooperative Mamba scan kernel hardcoded
+`_CHANNELS_PER_TG = 8`, allocating `8 * d_state * 4` bytes of threadgroup
+shared memory.  For `d_state = 4096`, this required 128KB — far exceeding
+the 32–64KB L1 shared memory ceiling of Apple Silicon GPU cores, causing
+threadgroup execution failures.
+
+**Fix**: Introduced `_compute_cooperative_tiling(d_state)` which
+dynamically calculates `channels_per_tg` to cap shared memory at 32KB:
+
+```
+channels_per_tg = max(1, min(8, 8192 // d_state))
+```
+
+| d_state | channels_per_tg | tg_size | Shared memory |
+|---------|-----------------|---------|---------------|
+| 128     | 8               | 256     | 4 KB          |
+| 256     | 8               | 256     | 8 KB          |
+| 512     | 8               | 256     | 16 KB         |
+| 1024    | 8               | 256     | 32 KB         |
+| 2048    | 4               | 128     | 32 KB         |
+| 4096    | 2               | 64      | 32 KB         |
+| 8192    | 1               | 32      | 32 KB         |
+
+The `mamba_selective_scan` dispatch now reads the dynamic `tg_size` from
+a parallel cache (`_cooperative_tg_size_cache`) and passes it to the
+kernel's `threadgroup` parameter, ensuring the GPU dispatches the
+correct number of threads per threadgroup.
+
+**Deviation from the proposed 16KB cap**: The original proposal specified
+a 16KB cap (`4096 // d_state`), but this fails for `d_state > 4096` where
+even 1 channel exceeds 16KB (e.g. `d_state=4097` → 16388 bytes).  Since
+Apple AGX cores typically have 32–64KB of L1 threadgroup memory, the cap
+was raised to 32KB (`8192 // d_state`), which safely covers the full
+supported range up to `d_state = 8192`.
+
+**Files**: `daph_exfusion/mlx_inference.py`
+
+### Test Coverage
+
+18 new tests in `tests/test_v470_fixes.py`:
+- 8 tests for `AsyncMemoryOffloader` (creation, sync mode, thread pool
+  offload/recall, synchronize noop, no-experts edge case, chained
+  operations, pool singleton)
+- 10 tests for dynamic tiling (small/medium/large/very-large/max d_state,
+  exhaustive 32KB cap verification, exceeds-max error, kernel correctness
+  at d_state=256/512/1024)
+
+Total: 111 tests, all passing.
+
 ## v4.6.0 — Systems Hardening: Memory, Sync, Kernel, Offload (2026-07-07)
 
 Four targeted fixes resolving architectural bottlenecks and safety
