@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daph-exfusion"
+version = "2026.07.4.2"
+description = "DAPH ExFusion: Unified Expert Merging and MLX Native Inference"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "DAPH Research Team"}]
+keywords = ["mixture-of-experts", "model-merging", "mlx", "apple-silicon", "mamba"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = ["numpy>=1.24", "torch>=2.0.0"]
+
+[project.optional-dependencies]
+mlx = ["mlx>=0.5.0"]
+dev = ["pytest>=7.0", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://github.com/daph-research/daph-exfusion"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["daph_exfusion*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"
