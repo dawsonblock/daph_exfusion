@@ -98,10 +98,13 @@ def test_mamba_seed_determinism():
             for e in mamba.experts
         ]
 
+    # Re-seed before each instantiation so both blocks get identical expert weights
+    torch.manual_seed(0)
     mamba1 = MemoryBankExFusionMamba(make_block, num_experts, hidden_size)
     mamba1.merge_to_dense(fisher_diagonals=make_fishers(mamba1), seed=42)
     p1 = {name: param.clone() for name, param in mamba1.merged_mamba.named_parameters()}
 
+    torch.manual_seed(0)
     mamba2 = MemoryBankExFusionMamba(make_block, num_experts, hidden_size)
     mamba2.merge_to_dense(fisher_diagonals=make_fishers(mamba2), seed=42)
     p2 = {name: param.clone() for name, param in mamba2.merged_mamba.named_parameters()}

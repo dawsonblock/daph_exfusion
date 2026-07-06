@@ -13,12 +13,17 @@ from daph_exfusion.benchmark import (
 
 
 class DummyModel(nn.Module):
-    def __init__(self, hidden_size=16):
+    """Causal dummy model that handles both integer tokens and continuous embeddings."""
+    def __init__(self, vocab_size=1000, hidden_size=16):
         super().__init__()
         self.hidden_size = hidden_size
-        self.linear = nn.Linear(hidden_size, hidden_size)
+        self.embed = nn.Embedding(vocab_size, hidden_size)
+        self.linear = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, x):
+        # If input is integer token IDs, project through embedding first
+        if x.dtype in (torch.long, torch.int32, torch.int64):
+            x = self.embed(x)
         return self.linear(x)
 
 
@@ -51,7 +56,7 @@ def test_latency_measurement():
 
 
 def test_lra_copy_eval():
-    model = DummyModel(hidden_size=1000)
+    model = DummyModel(vocab_size=1000, hidden_size=16)
     suite = MoEBenchmarkSuite(model)
     results = suite.evaluate_lra_copy(seq_lengths=[16, 32], num_samples=5)
     assert 16 in results
@@ -73,8 +78,8 @@ def test_ablation_study_runs():
         def __iter__(self):
             for _ in range(self.batches):
                 yield {
-                    "input_ids": torch.randn(2, 8, 16),
-                    "labels": torch.randint(0, 16, (2, 8)),
+                    "input_ids": torch.randint(0, 1000, (2, 8)),
+                    "labels": torch.randint(0, 1000, (2, 8)),
                 }
         def __len__(self):
             return self.batches

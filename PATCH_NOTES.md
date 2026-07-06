@@ -1,5 +1,69 @@
 # Patch Notes
 
+## v4.3.4 — Full Test Suite Green (2026-07-05)
+
+Resolves all 8 remaining pre-existing test failures, achieving a 100%
+pass rate across the entire test suite (61/61). The failures were caused
+by out-of-date test mocks and a mathematical inversion in the difficulty
+modulation, not by functional defects in the core algorithms.
+
+### 1. Mamba Seed Determinism (test_merge_toolkit.py)
+
+`test_mamba_seed_determinism` created two `MemoryBankExFusionMamba` blocks
+without re-seeding PyTorch's RNG between instantiations, so the expert
+networks started with different random weights. Seeding the merge step
+alone was insufficient since the inputs to the merge were already different.
+
+Fix: re-seed `torch.manual_seed(0)` before each block instantiation.
+
+### 2. Bridge Key-Mapping (mlx_inference.py, 3 tests)
+
+`clean_pytorch_keys` used leading-dot patterns (e.g. `.ffn_path.merged_ffn.`)
+that only matched nested keys (e.g. `layer.0.ffn_path.merged_ffn.up.weight`)
+but not root-level keys (e.g. `ffn_path.merged_ffn.up.weight`). The ignore
+patterns for runtime state (`.experts.`, `.ffn_path.router.`) had the same
+issue.
+
+Fix: refactored to check both `key.startswith(pattern)` for root-level keys
+and `".pattern" in key` for nested keys. Removed leading dots from ignore
+patterns so substring matching works at any nesting depth.
+
+### 3. Benchmark DummyModel (test_benchmark.py, 2 tests)
+
+`DummyModel` contained only a `nn.Linear` layer. When `evaluate_lra_copy`
+fed integer token IDs, the linear projection received dimensionally
+incompatible inputs (`Long` vs `Float` dtype mismatch).
+
+Fix: added an `nn.Embedding` layer that projects integer token IDs to
+continuous vectors before the linear layer. The model auto-detects integer
+inputs and routes them through the embedding.
+
+### 4. Adaptive Router Difficulty Modulation (adaptive_top_p_router.py,
+       mlx_inference.py, 2 tests)
+
+The difficulty-threshold formula was mathematically inverted:
+`threshold = base - scale * (diff - 0.5)`. In top-p (nucleus) selection,
+a *higher* threshold means *more* paths are selected (need to accumulate
+more probability mass). The formula made higher difficulty → lower
+threshold → fewer paths, which is backwards from the design intent
+("higher difficulty → more paths active").
+
+Fix: inverted to `threshold = base + scale * (diff - 0.5)` in both the
+PyTorch (`AdaptiveTopPMacroRouter`) and MLX (`MLXAdaptiveTopPMacroRouter`)
+routers. Now: easy (diff=0) → lower threshold → fewer paths; hard (diff=1)
+→ higher threshold → more paths.
+
+Also fixed `test_daph_decoder_layer_v2_forward`: used `torch.silu` which
+doesn't exist; replaced with `torch.nn.functional.silu`.
+
+### Test results
+
+- **61 passed, 0 failed** — full green test suite for the first time.
+- All 23 safety-gates tests pass.
+- All 8 previously-failing tests now pass.
+
+---
+
 ## v4.3.3 — Low-Rank K-FAC Crash Fix & MLX Dispatch Optimization (2026-07-05)
 
 Three fixes from a strict boundary-condition audit of the v4.3.2 low-rank

@@ -2,6 +2,7 @@
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from daph_exfusion.adaptive_top_p_router import AdaptiveTopPMacroRouter, DAPHDecoderLayerV2
 from daph_exfusion.merge_toolkit import MemoryBankExFusionFFN, MemoryBankExFusionMamba
@@ -72,7 +73,7 @@ def test_daph_decoder_layer_v2_forward():
             def forward(self, x):
                 h = self.in_proj(x)
                 a, b = h[..., :hidden_size], h[..., hidden_size:]
-                u = torch.silu(a) * b
+                u = F.silu(a) * b
                 return self.out_proj(u + self.D * u)
         return Block()
 

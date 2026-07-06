@@ -88,8 +88,10 @@ class AdaptiveTopPMacroRouter(nn.Module):
         else:
             diff = self.difficulty_predictor(flat).squeeze(-1)  # (B*L,)
 
-        # Threshold: higher difficulty → lower threshold → more paths
-        threshold = self.base_threshold - self.difficulty_scale * (diff - 0.5)
+        # Threshold: higher difficulty → higher threshold → more paths active.
+        # In top-p (nucleus) selection, a higher cumulative-probability threshold
+        # requires accumulating more paths to cross it, so more paths are selected.
+        threshold = self.base_threshold + self.difficulty_scale * (diff - 0.5)
         threshold = torch.clamp(threshold, min=0.4, max=0.95)
 
         # Top-p selection: sort descending, accumulate, select prefix

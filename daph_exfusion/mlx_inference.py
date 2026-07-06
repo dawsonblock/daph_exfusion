@@ -476,32 +476,45 @@ class MLXDAPHDecoderLayer(nn.Module):
 # =============================================================================
 
 def clean_pytorch_keys(state_dict: dict) -> dict:
-    """Corrects structural wrapper changes in nested classes for dense mapping."""
+    """Corrects structural wrapper changes in nested classes for dense mapping.
+
+    Handles both root-level keys (e.g. ``ffn_path.merged_ffn.up.weight``) and
+    nested keys (e.g. ``layer.0.ffn_path.merged_ffn.up.weight``) by checking
+    for the pattern with and without a leading dot.
+    """
     cleaned = {}
+    # (old_pattern, new_pattern) — applied as substring replacement
+    replacements = [
+        ("ffn_path.merged_ffn.", "ffn_path."),
+        ("mamba_path.merged_mamba.", "mamba_path."),
+        ("attn_path.q_proj.", "attention_path.attn.q_proj."),
+        ("attn_path.k_proj.", "attention_path.attn.k_proj."),
+        ("attn_path.v_proj.", "attention_path.attn.v_proj."),
+        ("attn_path.o_proj.", "attention_path.attn.o_proj."),
+        ("attn_path.norm.", "attention_path.norm."),
+    ]
     for key, value in state_dict.items():
-        if ".ffn_path.merged_ffn." in key:
-            key = key.replace(".ffn_path.merged_ffn.", ".ffn_path.")
-        elif ".mamba_path.merged_mamba." in key:
-            key = key.replace(".mamba_path.merged_mamba.", ".mamba_path.")
-        elif ".attn_path.q_proj." in key:
-            key = key.replace(".attn_path.q_proj.", ".attention_path.attn.q_proj.")
-        elif ".attn_path.k_proj." in key:
-            key = key.replace(".attn_path.k_proj.", ".attention_path.attn.k_proj.")
-        elif ".attn_path.v_proj." in key:
-            key = key.replace(".attn_path.v_proj.", ".attention_path.attn.v_proj.")
-        elif ".attn_path.o_proj." in key:
-            key = key.replace(".attn_path.o_proj.", ".attention_path.attn.o_proj.")
-        elif ".attn_path.norm." in key:
-            key = key.replace(".attn_path.norm.", ".attention_path.norm.")
-            
-        # Target state parameters of experts to drop during dense map initialization
+        for old, new in replacements:
+            # Root-level: key starts with the pattern
+            if key.startswith(old):
+                key = new + key[len(old):]
+                break
+            # Nested: pattern appears after a dot
+            dot_old = "." + old
+            if dot_old in key:
+                key = key.replace(dot_old, "." + new, 1)
+                break
+
+        # Drop runtime state and expert parameters that don't exist in the
+        # dense (merged) model.  Patterns work for both root-level and nested
+        # keys since we use ``in`` substring matching.
         if any(ignore in key for ignore in [
-            "memory_bank", "step_count", ".experts.", 
-            ".ffn_path.router.", ".ffn_path.router_out.",
-            ".mamba_path.router.", ".mamba_path.router_out."
+            "memory_bank", "step_count", "experts",
+            "ffn_path.router", "ffn_path.router_out",
+            "mamba_path.router", "mamba_path.router_out"
         ]):
             continue
-            
+
         cleaned[key] = value
     return cleaned
 
@@ -549,7 +562,10 @@ class MLXAdaptiveTopPMacroRouter(nn.Module):
         difficulty = self.difficulty_predictor(flat)        # (B*L, 1)
         diff_sq = difficulty.squeeze(-1)                  # (B*L,)
 
-        threshold = self.base_threshold - self.difficulty_scale * (diff_sq - 0.5)
+        # Threshold: higher difficulty → higher threshold → more paths active.
+        # In top-p (nucleus) selection, a higher cumulative-probability threshold
+        # requires accumulating more paths to cross it, so more paths are selected.
+        threshold = self.base_threshold + self.difficulty_scale * (diff_sq - 0.5)
         threshold = mx.clip(threshold, 0.4, 0.95)  # (B*L,)
 
         # Descending sort via negation
