@@ -512,7 +512,9 @@ def test_block_diag_kfac_edge_dims(dim, block_size):
 # 15. Low-rank K-FAC mode
 # ---------------------------------------------------------------------------
 def test_low_rank_kfac_mode():
-    """Verify low-rank K-FAC mode stores (U, s) factors and produces valid scores."""
+    """Verify low-rank K-FAC mode stores (U, s) factors and produces valid
+    scores across multiple batches (verifying the incremental QR/SVD update
+    step that runs on the second and subsequent batches)."""
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -523,9 +525,18 @@ def test_low_rank_kfac_mode():
 
     cfg = KFACConfig(diagonal_only=False, low_rank=True, rank=8)
     tracker = KFACFisherTracker(_Model(), config=cfg)
-    x = torch.randn(4, 64)
-    out = tracker.model(x)
-    out.sum().backward()
+
+    # Batch 1: initializes the low-rank covariance factors
+    x1 = torch.randn(4, 64)
+    out1 = tracker.model(x1)
+    out1.sum().backward()
+
+    # Batch 2: triggers the incremental SVD update branch (the else block).
+    # This is the path that crashed before the matmul fix.
+    tracker.model.zero_grad()
+    x2 = torch.randn(4, 64)
+    out2 = tracker.model(x2)
+    out2.sum().backward()
 
     for name, cov in tracker.a_factors.items():
         assert cov.mode == "low_rank", f"Expected 'low_rank' mode, got '{cov.mode}'"
@@ -535,7 +546,9 @@ def test_low_rank_kfac_mode():
 
     # Score should be a valid positive float
     score = tracker.layer_score("proj")
-    assert isinstance(score, float), f"Expected float, got {type(score)}"
+    assert isinstance(score, float) and score > 0, (
+        f"Expected positive float, got {score}"
+    )
 
     # Diagonal extraction should work
     diag = tracker.a_factors["proj"].diagonal()

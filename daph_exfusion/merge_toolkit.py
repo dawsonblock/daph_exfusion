@@ -251,24 +251,28 @@ class RunningCovariance:
                 self.initialized = True
             else:
                 # EMA update: new_cov = decay * old + (1-decay) * batch_cov
-                # In rank-k form: combine old (U, s) with new samples
-                # Scale old by decay
+                # In rank-k form: combine old (U, s) with new samples.
+                # We form a (D, k + S) basis matrix B whose left singular
+                # vectors approximate the top-k eigenvectors of the EMA
+                # covariance, avoiding materialising the full (D, D) matrix.
                 s_old = self.s * self.decay
                 # Project new samples onto complement of U
                 x_proj = x @ self.U  # (S, k)
                 x_resid = x - x_proj @ self.U.t()  # (S, D) residual
-                # Orthonormalize residual via QR
+                # Orthonormalize residual via QR of the (D, S) transpose
                 Q_resid, R_resid = torch.linalg.qr(x_resid.t(), mode='reduced')
                 # Q_resid: (D, min(S, D)), take at most k columns
                 Q_resid = Q_resid[:, :k]
                 R_resid = R_resid[:k, :]  # (k, S)
-                # Combined basis: [U * sqrt(s_old), Q_resid * R_resid * sqrt(1-decay)/sqrt(S)]
                 scale_old = s_old.sqrt().unsqueeze(0)  # (1, k)
-                scale_new = ((1.0 - self.decay) / samples).sqrt()
+                scale_new = ((1.0 - self.decay) / samples) ** 0.5
+                # FIX: use matrix multiplication (@) not elementwise (*).
+                # Q_resid is (D, k), R_resid is (k, S) → Q_resid @ R_resid
+                # yields (D, S), then scale by the scalar scale_new.
                 B = torch.cat([
-                    self.U * scale_old,           # (D, k) scaled old eigenvectors
-                    Q_resid * (R_resid * scale_new),  # (D, k) scaled new residual
-                ], dim=1)  # (D, 2k)
+                    self.U * scale_old,                  # (D, k)
+                    Q_resid @ (R_resid * scale_new),     # (D, S)
+                ], dim=1)  # (D, k + S)
                 # SVD of B to get new top-k
                 U_new, s_new, _ = torch.linalg.svd(B, full_matrices=False)
                 self.U = U_new[:, :k]
@@ -447,23 +451,32 @@ class KFACFisherTracker:
     def layer_score(self, layer_name: str) -> float:
         A, G = self.get_factors(layer_name)
 
-        # Handle low-rank factored form: A = (U, s), G = (U_g, s_g)
+        # Handle low-rank factored form: A = (U, s + d), G = (U_g, s_g + d)
         if isinstance(A, tuple):
-            U_a, s_a = A
-            U_g, s_g = G
-            # trace(U @ diag(s) @ U^T) = sum(s) since U has orthonormal columns
-            tr_a = s_a.sum()
-            tr_g = s_g.sum()
+            U_a, s_a_damped = A
+            U_g, s_g_damped = G
+            d = self.config.damping
+            dim_a = self.a_factors[layer_name].dim
+            dim_g = self.g_factors[layer_name].dim
+            # Correct trace of (U @ diag(s) @ U^T + d * I):
+            #   trace = sum(s) + d * dim
+            # Since s_a_damped = s_a + d, sum(s_a_damped) = sum(s_a) + k * d,
+            # so sum(s_a) = sum(s_a_damped) - k * d, and the correct trace is
+            #   sum(s_a_damped) - k * d + d * dim_a = sum(s_a_damped) + d * (dim_a - k)
+            k_a = s_a_damped.shape[0]
+            k_g = s_g_damped.shape[0]
+            tr_a = s_a_damped.sum() + d * (dim_a - k_a)
+            tr_g = s_g_damped.sum() + d * (dim_g - k_g)
             if self.config.score_mode == "trace":
                 score = tr_a * tr_g
             elif self.config.score_mode == "log_trace":
                 score = torch.log1p(tr_a) * torch.log1p(tr_g)
             elif self.config.score_mode == "fro":
                 # ||U @ diag(s) @ U^T||_F = ||s|| (since U is orthonormal)
-                score = s_a.norm() * s_g.norm()
+                score = s_a_damped.norm() * s_g_damped.norm()
             elif self.config.score_mode == "spectral_proxy":
                 # Max eigenvalue is max(s) for the factored form
-                score = s_a.max().clamp_min(0) * s_g.max().clamp_min(0)
+                score = s_a_damped.max().clamp_min(0) * s_g_damped.max().clamp_min(0)
             else:
                 raise ValueError(f"Unknown score_mode: {self.config.score_mode}")
             if self.config.normalize_by_params:

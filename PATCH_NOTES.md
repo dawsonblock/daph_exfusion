@@ -1,5 +1,63 @@
 # Patch Notes
 
+## v4.3.3 — Low-Rank K-FAC Crash Fix & MLX Dispatch Optimization (2026-07-05)
+
+Three fixes from a strict boundary-condition audit of the v4.3.2 low-rank
+K-FAC SVD update and MLX stateful generation pipeline.
+
+### 1. Low-Rank K-FAC SVD Update Dimensional Crash (Critical)
+
+`RunningCovariance.update()` in `merge_toolkit.py` used elementwise
+multiplication (`*`) instead of matrix multiplication (`@`) when combining
+the residual basis with the new sample scaling:
+
+```
+# BUG: Q_resid (D, k) * R_resid (k, S) → shape mismatch crash
+Q_resid * (R_resid * scale_new)
+
+# FIX: Q_resid (D, k) @ R_resid (k, S) → (D, S) correct
+Q_resid @ (R_resid * scale_new)
+```
+
+This crashed on the second batch (the incremental SVD update branch). The
+original test only ran one forward/backward pass, so it never triggered the
+`else:` branch where the bug lived.
+
+Also fixed `scale_new` being a Python float (no `.sqrt()` method) — now
+uses `** 0.5` operator.
+
+- Regression: `test_low_rank_kfac_mode` now runs two batches
+
+### 2. Low-Rank Trace Damping Deficit
+
+`layer_score()` computed `trace(A) = sum(s + d) = sum(s) + k * d`, but the
+mathematically exact trace of `U @ diag(s) @ U^T + d * I` is
+`sum(s) + d * dim`. For rank=32, dim=4096, this missed `(dim - k) * d` of
+damping mass, skewing layer-importance scores.
+
+Fixed to: `tr_a = sum(s_damped) + d * (dim - k)`, which correctly accounts
+for the isotropic damping across the full dimension.
+
+### 3. MLX Generate Dispatch Consolidation
+
+`MLXStatefulCausalLM.generate()` previously called `mx.eval()` in separate
+loops for `next_token`, KV-caches, SSM states, and conv states — resulting
+in `1 + 3 * num_layers` sequential GPU dispatches per token (97 dispatches
+for a 32-layer model).
+
+Consolidated into a single `mx.eval(*eval_targets)` call per step, so MLX
+compiles and executes all arrays in one GPU pass — reducing to 1 dispatch
+per token.
+
+### Test results
+
+- **53 passed, 8 failed** (all 8 failures are pre-existing and unrelated).
+- All 23 safety-gates tests pass.
+- `test_low_rank_kfac_mode` now runs two batches, covering the incremental
+  SVD update branch.
+
+---
+
 ## v4.3.2 — Performance & K-FAC Low-Rank Mode (2026-07-05)
 
 Addresses the four priority next steps identified in the v4.3.1 deep

@@ -949,15 +949,17 @@ class MLXStatefulCausalLM(nn.Module):
         generated_tokens = [int(next_token.item())]
         current_len = len(prompt_tokens)
 
-        # Force evaluation of the pre-fill graph to release intermediate tensors
-        mx.eval(next_token)
+        # Force evaluation of the pre-fill graph to release intermediate tensors.
+        # Consolidate all arrays into a single mx.eval() call so MLX compiles
+        # and executes them in one GPU dispatch pass instead of 1 + 3*N_layers
+        # sequential dispatches.
+        eval_targets = [next_token]
         for c in caches:
             if c.keys is not None:
-                mx.eval(c.keys, c.values)
-        for s in ssm_states:
-            mx.eval(s.h)
-        for c in conv_states:
-            mx.eval(c.history)
+                eval_targets.extend([c.keys, c.values])
+        eval_targets.extend([s.h for s in ssm_states])
+        eval_targets.extend([c.history for c in conv_states])
+        mx.eval(*eval_targets)
 
         # --- Phase 2: Autoregressive decoding --------------------------------
         for _ in range(max_new_tokens - 1):
@@ -975,14 +977,14 @@ class MLXStatefulCausalLM(nn.Module):
             generated_tokens.append(int(next_token.item()))
             current_len += 1
 
-            # Prune the lazy evaluation graph to prevent VRAM accumulation
-            mx.eval(next_token)
+            # Prune the lazy evaluation graph to prevent VRAM accumulation.
+            # Single consolidated mx.eval() call — one GPU dispatch per token.
+            eval_targets = [next_token]
             for c in caches:
                 if c.keys is not None:
-                    mx.eval(c.keys, c.values)
-            for s in ssm_states:
-                mx.eval(s.h)
-            for c in conv_states:
-                mx.eval(c.history)
+                    eval_targets.extend([c.keys, c.values])
+            eval_targets.extend([s.h for s in ssm_states])
+            eval_targets.extend([c.history for c in conv_states])
+            mx.eval(*eval_targets)
 
         return generated_tokens
